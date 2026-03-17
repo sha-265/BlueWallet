@@ -13,10 +13,12 @@ import { ElectrumServerItem } from '../screen/settings/ElectrumSettings';
 import { triggerWarningHapticFeedback } from './hapticFeedback';
 import { AlertButton } from 'react-native';
 import { uint8ArrayToHex, stringToUint8Array, hexToUint8Array } from './uint8array-extras/index';
+import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 
 const ElectrumClient = require('electrum-client');
 const net = require('net');
 const tls = require('tls');
+const navigation = useExtendedNavigation();
 
 type Utxo = {
   height: number;
@@ -426,15 +428,9 @@ const presentNetworkErrorAlert = async (usingPeer?: Peer) => {
       },
       {
         text: loc.settings.electrum_reset,
-        onPress: () => {
-          presentResetToDefaultsAlert().then(result => {
-            if (result) {
-              connectionAttempt = 0;
-              mainClient?.close();
-              mainClient = undefined;
-              setTimeout(connectMain, 500);
-            }
-          });
+          onPress: () => {
+            navigation.navigate('ElectrumSettings');
+          },
         },
         style: 'destructive',
       },
