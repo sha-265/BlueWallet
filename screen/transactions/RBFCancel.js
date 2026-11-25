@@ -1,14 +1,16 @@
 import React from 'react';
 import PropTypes from 'prop-types';
-import { ActivityIndicator, ScrollView, View } from 'react-native';
-import { BlueText } from '../../BlueComponents';
-import { HDSegwitBech32Transaction, HDSegwitBech32Wallet } from '../../class';
+import { ActivityIndicator, View } from 'react-native';
+import BlueText from '../../components/BlueText';
+import { HDSegwitBech32Transaction, TxVerificationError } from '../../class/hd-segwit-bech32-transaction';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
 import presentAlert from '../../components/Alert';
 import SafeArea from '../../components/SafeArea';
 import loc from '../../loc';
 import CPFP from './CPFP';
 import { StorageContext } from '../../components/Context/StorageProvider';
 import { BlueSpacing20 } from '../../components/BlueSpacing';
+import { isWatchOnlySegwitBech32 } from '../../util/isWatchOnlySegwitBech32';
 
 export default class RBFCancel extends CPFP {
   static contextType = StorageContext;
@@ -19,15 +21,28 @@ export default class RBFCancel extends CPFP {
       newFeeRate: '',
       nonReplaceable: false,
     });
-    await this.checkPossibilityOfRBFCancel();
+    try {
+      await this.checkPossibilityOfRBFCancel();
+    } catch (error) {
+      // if anything goes wrong we just show "this is not bumpable" message
+      this.setState({ nonReplaceable: true, unverified: error instanceof TxVerificationError, isLoading: false });
+    }
   }
 
   async checkPossibilityOfRBFCancel() {
-    if (this.state.wallet.type !== HDSegwitBech32Wallet.type) {
+    let tx;
+    if (isWatchOnlySegwitBech32(this.state.wallet)) {
+      tx = new HDSegwitBech32Transaction(
+        null,
+        this.state.txid,
+        this.state.wallet._hdWalletInstance,
+        this.state.wallet.getMasterFingerprint(),
+      );
+    } else if (this.state.wallet?.type === HDSegwitBech32Wallet.type) {
+      tx = new HDSegwitBech32Transaction(null, this.state.txid, this.state.wallet);
+    } else {
       return this.setState({ nonReplaceable: true, isLoading: false });
     }
-
-    const tx = new HDSegwitBech32Transaction(null, this.state.txid, this.state.wallet);
     if (
       (await tx.isOurTransaction()) &&
       (await tx.getRemoteConfirmationsNum()) === 0 &&
@@ -35,7 +50,6 @@ export default class RBFCancel extends CPFP {
       (await tx.canCancelTx())
     ) {
       const info = await tx.getInfo();
-      console.log({ info });
       return this.setState({ nonReplaceable: false, feeRate: info.feeRate + 1, isLoading: false, tx });
       // 1 sat makes a lot of difference, since sometimes because of rounding created tx's fee might be insufficient
     } else {
@@ -44,13 +58,40 @@ export default class RBFCancel extends CPFP {
   }
 
   async createTransaction() {
-    const newFeeRate = parseInt(this.state.newFeeRate, 10);
+    const newFeeRate = Number(this.state.newFeeRate);
     if (newFeeRate > this.state.feeRate) {
       /** @type {HDSegwitBech32Transaction} */
       const tx = this.state.tx;
       this.setState({ isLoading: true });
       try {
-        const { tx: newTx } = await tx.createRBFcancelTx(newFeeRate);
+        const { tx: newTx, psbt } = await tx.createRBFcancelTx(newFeeRate);
+
+        // watch-only wallets with enabled HW wallet support have different flow. we have to show PSBT to user as QR code
+        // so he can scan it and sign it. then we have to scan it back from user (via camera and QR code), and ask
+        // user whether he wants to broadcast it
+        if (isWatchOnlySegwitBech32(this.state.wallet)) {
+          let memo;
+
+          // porting tx memo
+          if (this.context.txMetadata[this.state.txid]?.memo) {
+            memo = this.context.txMetadata[this.state.txid]?.memo;
+          }
+
+          this.props.navigation
+            .getParent()
+            ?.getParent()
+            ?.navigate('SendDetailsRoot', {
+              screen: 'PsbtWithHardwareWallet',
+              params: {
+                memo,
+                walletID: this.state.wallet.getID(),
+                psbt,
+              },
+            });
+          this.setState({ isLoading: false });
+          return;
+        }
+
         this.setState({ stage: 2, txhex: newTx.toHex(), newTxid: newTx.getId() });
         this.setState({ isLoading: false });
       } catch (_) {
@@ -71,7 +112,11 @@ export default class RBFCancel extends CPFP {
       this.context.txMetadata[this.state.newTxid].memo = 'Cancelled transaction';
     }
     this.context.sleep(4000).then(() => this.context.fetchAndSaveWalletTransactions(this.state.wallet.getID()));
-    this.props.navigation.navigate('Success', { amount: undefined });
+    this.props.navigation.navigate('Success', {
+      amount: undefined,
+      walletID: this.state.wallet.getID(),
+      walletType: this.state.wallet.type,
+    });
   }
 
   render() {
@@ -96,23 +141,12 @@ export default class RBFCancel extends CPFP {
           <BlueSpacing20 />
           <BlueSpacing20 />
 
-          <BlueText h4>{loc.transactions.cancel_no}</BlueText>
+          <BlueText h4>{this.state.unverified ? loc.transactions.rbf_unverified : loc.transactions.cancel_no}</BlueText>
         </SafeArea>
       );
     }
 
-    return (
-      <SafeArea>
-        <ScrollView
-          automaticallyAdjustContentInsets
-          automaticallyAdjustKeyboardInsets
-          automaticallyAdjustsScrollIndicatorInsets
-          contentInsetAdjustmentBehavior="automatic"
-        >
-          {this.renderStage1(loc.transactions.cancel_explain)}
-        </ScrollView>
-      </SafeArea>
-    );
+    return this.renderFeeSelection(loc.transactions.cancel_explain);
   }
 }
 

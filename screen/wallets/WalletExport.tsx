@@ -1,15 +1,17 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import Icon from '../../components/Icon';
 import { LayoutChangeEvent, ScrollView, StyleSheet, Pressable, View } from 'react-native';
 import { useScreenProtect } from '../../hooks/useScreenProtect';
 import { validateMnemonic } from '../../blue_modules/bip39';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
-import { BlueText } from '../../BlueComponents';
-import { LightningCustodianWallet, WatchOnlyWallet } from '../../class';
+import BlueText from '../../components/BlueText';
+import { LightningCustodianWallet } from '../../class/wallets/lightning-custodian-wallet';
+import { WatchOnlyWallet } from '../../class/wallets/watch-only-wallet';
 import HandOffComponent from '../../components/HandOffComponent';
-import QRCodeComponent from '../../components/QRCodeComponent';
+import QRCode from '../../components/QRCode';
 import SeedWords from '../../components/SeedWords';
 import { useTheme } from '../../components/themes';
 import { HandOffActivityType } from '../../components/types';
@@ -17,10 +19,9 @@ import { useSettings } from '../../hooks/context/useSettings';
 import { useStorage } from '../../hooks/context/useStorage';
 import useAppState from '../../hooks/useAppState';
 import loc from '../../loc';
-import { WalletExportStackParamList } from '../../navigation/WalletExportStack';
-import { WalletDescriptor } from '../../class/wallet-descriptor.ts';
+import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
 
-type RouteProps = RouteProp<WalletExportStackParamList, 'WalletExport'>;
+type RouteProps = RouteProp<DetailViewStackParamList, 'WalletExport'>;
 
 const HORIZONTAL_PADDING = 20;
 
@@ -58,7 +59,7 @@ const DoNotDisclose: React.FC = () => {
 const WalletExport: React.FC = () => {
   const { wallets } = useStorage();
   const { walletID } = useRoute<RouteProps>().params;
-  const navigation = useNavigation();
+  const navigation = useNavigation<NativeStackNavigationProp<DetailViewStackParamList, 'WalletExport'>>();
   const { isPrivacyBlurEnabled } = useSettings();
   const { colors } = useTheme();
   const wallet = wallets.find(w => w.getID() === walletID)!;
@@ -71,19 +72,7 @@ const WalletExport: React.FC = () => {
 
   const secrets: string[] = useMemo(() => {
     try {
-      let secret = wallet.getSecret();
-      if (wallet instanceof WatchOnlyWallet) {
-        try {
-          const path = wallet.getDerivationPath();
-          if (path?.startsWith('m/86')) {
-            // for taproot watch-only HD we dont just show xpub, we show wallet descriptor
-            const fp = wallet.getMasterFingerprintHex();
-            secret = WalletDescriptor.getDescriptor(fp, path, secret);
-          }
-        } catch (e: any) {
-          console.log(e.message);
-        }
-      }
+      const secret = wallet instanceof WatchOnlyWallet ? wallet.getSecretForExport() : wallet.getSecret();
       return typeof secret === 'string' ? [secret] : Array.isArray(secret) ? secret : [];
     } catch (error) {
       console.error('Failed to get wallet secret:', error);
@@ -194,7 +183,7 @@ const WalletExport: React.FC = () => {
       <BlueText style={styles.scanText}>{loc.wallets.scan_import}</BlueText>
 
       <View style={styles.qrCodeContainer}>
-        <QRCodeComponent isMenuAvailable={false} value={secret} size={qrCodeSize} logoSize={70} />
+        <QRCode isMenuAvailable={false} value={secret} size={qrCodeSize} logoSize={70} />
       </View>
 
       {/* Do not allow to copy mnemonic */}

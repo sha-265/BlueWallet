@@ -1,35 +1,57 @@
-import React, { useCallback, useEffect, useReducer, useRef, useMemo } from 'react';
-import { useFocusEffect, useIsFocused, useRoute, RouteProp } from '@react-navigation/native';
-import { Alert, findNodeHandle, Image, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import React, { useCallback, useContext, useEffect, useReducer, useRef, useMemo } from 'react';
+import { useNavigation, useFocusEffect, useIsFocused } from '@react-navigation/native';
+import {
+  Alert,
+  findNodeHandle,
+  Image,
+  StyleSheet,
+  Text,
+  useWindowDimensions,
+  View,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
+} from 'react-native';
 import { getClipboardContent } from '../../blue_modules/clipboard';
-import { isDesktop } from '../../blue_modules/environment';
+import { isDesktop, isIOS26OrHigher } from '../../blue_modules/environment';
 import * as fs from '../../blue_modules/fs';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
 import DeeplinkSchemaMatch from '../../class/deeplink-schema-match';
-import { ExtendedTransaction, Transaction, TWallet } from '../../class/wallets/types';
-import presentAlert from '../../components/Alert';
-import { FButton, FContainer } from '../../components/FloatButtons';
+import { ExtendedTransaction, TWallet } from '../../class/wallets/types';
+import presentAlert, { runAfterAlertDismissed } from '../../components/Alert';
+import { FButton, FContainer, FloatButtonsBottomFade, getFloatingButtonReservedHeight } from '../../components/FloatButtons';
 import { useTheme } from '../../components/themes';
 import { TransactionListItem } from '../../components/TransactionListItem';
-import WalletsCarousel from '../../components/WalletsCarousel';
-import { useSizeClass, SizeClass } from '../../blue_modules/sizeClass';
+import { TX_ROW_BASE_HEIGHT } from '../../components/ListItem';
+import WalletsCarousel, {
+  getWalletCarouselItemWidth,
+  CarouselListRefType,
+  getWalletCarouselHeight,
+} from '../../components/WalletsCarousel';
 import loc from '../../loc';
 import ActionSheet from '../ActionSheet';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
+import { shouldUseWideLayout } from '../../blue_modules/layout';
+import { ConnectionPollContext } from '../../navigation/ConnectionPollContext';
+import { RootParamList } from '../../navigation/RootParamList';
 import { useStorage } from '../../hooks/context/useStorage';
 import TotalWalletsBalance from '../../components/TotalWalletsBalance';
 import { useSettings } from '../../hooks/context/useSettings';
-import useMenuElements from '../../hooks/useMenuElements';
+import useScreenMenuActions from '../../hooks/useScreenMenuActions';
 import SafeAreaSectionList from '../../components/SafeAreaSectionList';
-import { scanQrHelper } from '../../helpers/scan-qr.ts';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
+import { scanQrHelper } from '../../helpers/scan-qr';
+import { errorMessage } from '../../helpers/errorMessage';
 
 const WalletsListSections = { CAROUSEL: 'CAROUSEL', TRANSACTIONS: 'TRANSACTIONS' };
+const SECTION_HEADER_BASE_HEIGHT = 56;
 
+/** Electrum `ping` while the list is visible; detects mid-session drops without polling when user is elsewhere. */
+const ELECTRUM_HEALTH_POLL_WHILE_WALLETS_LIST_FOCUSED_MS = 30_000;
+
+type WalletsListItem = ExtendedTransaction | string;
 type SectionData = {
   key: string;
-  data: Transaction[] | string[];
+  data: WalletsListItem[];
 };
 
 enum ActionTypes {
@@ -90,26 +112,29 @@ function reducer(state: WalletListState, action: WalletListAction) {
   }
 }
 
-type NavigationProps = NativeStackNavigationProp<DetailViewStackParamList, 'WalletsList'>;
-type RouteProps = RouteProp<DetailViewStackParamList, 'WalletsList'>;
+type NavigationProps = NativeStackNavigationProp<RootParamList, 'WalletsList'>;
 
 const WalletsList: React.FC = () => {
   const [state, dispatch] = useReducer(reducer, initialState);
   const { isLoading } = state;
-  const { sizeClass, isLarge } = useSizeClass();
-  const walletsCarousel = useRef<any>(null);
+  const walletsCarousel = useRef<CarouselListRefType>(null);
+  const connectionPoll = useContext(ConnectionPollContext);
   const currentWalletIndex = useRef<number>(0);
-  const { registerTransactionsHandler, unregisterTransactionsHandler } = useMenuElements();
-  const { wallets, getTransactions, refreshAllWalletTransactions } = useStorage();
+  const { wallets, getTransactions, refreshAllWalletTransactions, addWallet, saveToDisk, setSharedCosigner } = useStorage();
   const { isTotalBalanceEnabled, isElectrumDisabled } = useSettings();
-  const { width } = useWindowDimensions();
+  const { height, width, fontScale } = useWindowDimensions();
+  const isWideLayout = shouldUseWideLayout(width, height);
+  const insets = useSafeAreaInsets();
+  const carouselHeight = getWalletCarouselHeight(fontScale);
+  const transactionItemHeight = Math.round(TX_ROW_BASE_HEIGHT * fontScale);
+  const sectionHeaderHeight = Math.round(SECTION_HEADER_BASE_HEIGHT * fontScale);
+  const floatingButtonHeight = getFloatingButtonReservedHeight(fontScale, insets.bottom);
   const { colors, scanImage } = useTheme();
-  const navigation = useExtendedNavigation<NavigationProps>();
+  const navigation = useNavigation<NavigationProps>();
   const isFocused = useIsFocused();
-  const route = useRoute<RouteProps>();
   const dataSource = getTransactions(undefined, 10);
   const walletsCount = useRef<number>(wallets.length);
-  const walletActionButtonsRef = useRef<any>(null);
+  const walletActionButtonsRef = useRef<View>(null);
 
   const stylesHook = StyleSheet.create({
     walletsListWrapper: {
@@ -117,35 +142,40 @@ const WalletsList: React.FC = () => {
     },
     listHeaderBack: {
       backgroundColor: colors.background,
-      paddingTop: sizeClass === SizeClass.Large ? 8 : 0,
+      paddingTop: isWideLayout ? 8 : 0,
+      minHeight: sectionHeaderHeight,
     },
     listHeaderText: {
       color: colors.foregroundColor,
-      flexShrink: 1,
+      marginVertical: Math.round(16 * fontScale),
     },
   });
 
   const refreshWallets = useCallback(
     async (index: number | undefined, showLoadingIndicator = true, showUpdateStatusIndicator = false) => {
       if (isElectrumDisabled) return;
-      dispatch({ type: ActionTypes.SET_LOADING, payload: showLoadingIndicator });
+      // A background carousel refresh must not clear an active pull-to-refresh indicator.
+      if (showLoadingIndicator) dispatch({ type: ActionTypes.SET_LOADING, payload: true });
       try {
         await refreshAllWalletTransactions(index, showUpdateStatusIndicator);
       } catch (error) {
         console.error(error);
       } finally {
-        dispatch({ type: ActionTypes.SET_LOADING, payload: false });
+        // Keep refreshing true while a native alert is up, so dismissal delivers a real
+        // true-to-false transition to RefreshControl rather than repeating an already false prop.
+        const stopLoading = () => {
+          dispatch({ type: ActionTypes.SET_LOADING, payload: false });
+        };
+        if (!runAfterAlertDismissed(stopLoading)) stopLoading();
       }
     },
     [isElectrumDisabled, refreshAllWalletTransactions],
   );
 
-  /**
-   * Forcefully fetches TXs and balance for ALL wallets.
-   * Triggered manually by user on pull-to-refresh.
-   */
   const refreshTransactions = useCallback(() => {
-    refreshWallets(undefined, true, true);
+    // Manual pull-to-refresh already has its own loading UI, so we
+    // don't surface the global "Updating..." header pill here.
+    return refreshWallets(undefined, true, false);
   }, [refreshWallets]);
 
   useEffect(() => {
@@ -165,56 +195,51 @@ const WalletsList: React.FC = () => {
 
   const onRefresh = useCallback(() => {
     console.debug('WalletsList onRefresh');
-    refreshTransactions();
+    return refreshTransactions();
     // Optimized for Mac option doesn't like RN Refresh component. Menu Elements now handles it for macOS
   }, [refreshTransactions]);
 
-  useEffect(() => {
-    const screenKey = route.name;
-    console.log(`[WalletsList] Registering handler with key: ${screenKey}`);
-    registerTransactionsHandler(onRefresh, screenKey);
-
-    return () => {
-      console.log(`[WalletsList] Unmounting - cleaning up handler for: ${screenKey}`);
-      unregisterTransactionsHandler(screenKey);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [onRefresh, registerTransactionsHandler, unregisterTransactionsHandler]);
+  useScreenMenuActions({ reloadTransactions: !isElectrumDisabled && !isLoading ? onRefresh : undefined });
 
   useFocusEffect(
     useCallback(() => {
-      const screenKey = route.name;
-
-      return () => {
-        console.log(`[WalletsList] Blurred - cleaning up handler for: ${screenKey}`);
-        unregisterTransactionsHandler(screenKey);
-      };
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [unregisterTransactionsHandler]),
+      connectionPoll?.pollConnection();
+    }, [connectionPoll]),
   );
 
   useEffect(() => {
+    if (!isFocused || isElectrumDisabled || !connectionPoll) return;
+    const interval = setInterval(() => {
+      connectionPoll.pollConnection();
+    }, ELECTRUM_HEALTH_POLL_WHILE_WALLETS_LIST_FOCUSED_MS);
+    return () => clearInterval(interval);
+  }, [isFocused, isElectrumDisabled, connectionPoll]);
+
+  useEffect(() => {
     // new wallet added - no longer auto-scrolls
-    if (!isLarge) {
+    if (!isWideLayout) {
       // Just update the count, no scrolling
       walletsCount.current = wallets.length;
     }
-  }, [isLarge, wallets]);
+  }, [isWideLayout, wallets]);
 
   const onBarScanned = useCallback(
-    (value: any) => {
+    (value: string | undefined) => {
       if (!value) return;
       try {
-        DeeplinkSchemaMatch.navigationRouteFor({ url: value }, completionValue => {
-          triggerHapticFeedback(HapticFeedbackTypes.NotificationSuccess);
-          // @ts-ignore: for now
-          navigation.navigate(...completionValue);
-        });
-      } catch (e: any) {
-        Alert.alert(loc.send.details_scan_error, e.message);
+        DeeplinkSchemaMatch.navigationRouteFor(
+          { url: value },
+          completionValue => {
+            triggerHapticFeedback(HapticFeedbackTypes.NotificationSuccess);
+            navigation.navigate(...completionValue);
+          },
+          { wallets, addWallet, saveToDisk, setSharedCosigner },
+        );
+      } catch (e) {
+        Alert.alert(loc.send.details_scan_error, errorMessage(e));
       }
     },
-    [navigation],
+    [navigation, wallets, addWallet, saveToDisk, setSharedCosigner],
   );
 
   const handleClick = useCallback(
@@ -233,14 +258,17 @@ const WalletsList: React.FC = () => {
   );
 
   const onSnapToItem = useCallback(
-    (e: { nativeEvent: { contentOffset: any } }) => {
+    (e: NativeSyntheticEvent<NativeScrollEvent>) => {
       if (!isFocused) return;
 
       const contentOffset = e.nativeEvent.contentOffset;
-      const index = Math.ceil(contentOffset.x / width);
+      const cardWidth = getWalletCarouselItemWidth(width);
+      const snapStep = cardWidth; // keep in sync with WalletsCarousel snap interval
+      const index = Math.max(0, Math.round(contentOffset.x / snapStep));
 
       if (currentWalletIndex.current !== index) {
         console.debug('onSnapToItem', wallets.length === index ? 'NewWallet/Importing card' : index);
+        triggerHapticFeedback(HapticFeedbackTypes.Selection);
         if (wallets[index] && (wallets[index].timeToRefreshBalance() || wallets[index].timeToRefreshTransaction())) {
           refreshWallets(index, false, false);
         }
@@ -271,7 +299,14 @@ const WalletsList: React.FC = () => {
 
   const renderTransactionListsRow = useCallback(
     (item: ExtendedTransaction) => (
-      <TransactionListItem key={item.hash} item={item} itemPriceUnit={item.walletPreferredBalanceUnit} walletID={item.walletID} />
+      // Ark wallet rows have no on-chain `hash` — fall back to their
+      // synthetic `txid` so each row gets a unique React key.
+      <TransactionListItem
+        key={item.hash ?? (item as { txid?: string }).txid}
+        item={item}
+        itemPriceUnit={item.walletPreferredBalanceUnit}
+        walletID={item.walletID}
+      />
     ),
     [],
   );
@@ -297,22 +332,22 @@ const WalletsList: React.FC = () => {
   }, [handleClick, handleLongPress, isFocused, onSnapToItem, wallets]);
 
   const renderSectionItem = useCallback(
-    (item: { section: any; item: ExtendedTransaction }) => {
+    (item: { section: SectionData; item: WalletsListItem }) => {
       switch (item.section.key) {
         case WalletsListSections.CAROUSEL:
-          return sizeClass === SizeClass.Large ? null : renderWalletsCarousel();
+          return isWideLayout ? null : renderWalletsCarousel();
         case WalletsListSections.TRANSACTIONS:
-          return renderTransactionListsRow(item.item);
+          return typeof item.item === 'string' ? null : renderTransactionListsRow(item.item);
         default:
           return null;
       }
     },
-    [sizeClass, renderTransactionListsRow, renderWalletsCarousel],
+    [isWideLayout, renderTransactionListsRow, renderWalletsCarousel],
   );
 
   const renderSectionHeader = useCallback(
-    (section: { section: { key: any } }) => {
-      if (sizeClass === SizeClass.Large) {
+    (section: { section: SectionData }) => {
+      if (isWideLayout) {
         return null;
       }
 
@@ -320,21 +355,41 @@ const WalletsList: React.FC = () => {
         case WalletsListSections.TRANSACTIONS:
           return renderListHeaderComponent();
         case WalletsListSections.CAROUSEL: {
-          return isTotalBalanceEnabled ? (
+          const shouldShowTotalBalance = isTotalBalanceEnabled && wallets.length > 1;
+          return shouldShowTotalBalance ? (
             <View style={stylesHook.walletsListWrapper}>
               <TotalWalletsBalance />
             </View>
-          ) : null;
+          ) : (
+            <View style={[styles.listHeaderBack, stylesHook.listHeaderBack]}>
+              <Text
+                textBreakStrategy="simple"
+                style={[styles.listHeaderText, stylesHook.listHeaderText]}
+                numberOfLines={2}
+                adjustsFontSizeToFit={true}
+              >
+                {`${loc.wallets.wallets}${'  '}`}
+              </Text>
+            </View>
+          );
         }
         default:
           return null;
       }
     },
-    [sizeClass, isTotalBalanceEnabled, renderListHeaderComponent, stylesHook.walletsListWrapper],
+    [
+      isWideLayout,
+      isTotalBalanceEnabled,
+      renderListHeaderComponent,
+      stylesHook.listHeaderBack,
+      stylesHook.listHeaderText,
+      stylesHook.walletsListWrapper,
+      wallets.length,
+    ],
   );
 
   const renderSectionFooter = useCallback(
-    (section: { section: { key: any } }) => {
+    (section: { section: SectionData }) => {
       switch (section.section.key) {
         case WalletsListSections.TRANSACTIONS:
           if (dataSource.length === 0 && !isLoading) {
@@ -354,29 +409,6 @@ const WalletsList: React.FC = () => {
     [dataSource.length, isLoading],
   );
 
-  const renderScanButton = useCallback(() => {
-    if (wallets.length > 0) {
-      return (
-        <FContainer ref={walletActionButtonsRef.current}>
-          <FButton
-            onPress={onScanButtonPressed}
-            onLongPress={sendButtonLongPress}
-            icon={<Image resizeMode="stretch" source={scanImage} />}
-            text={loc.send.details_scan}
-            testID="HomeScreenScanButton"
-          />
-        </FContainer>
-      );
-    } else {
-      return null;
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scanImage, wallets.length]);
-
-  const sectionListKeyExtractor = useCallback((item: any, index: any) => {
-    return `${item}${index}}`;
-  }, []);
-
   const onScanButtonPressed = useCallback(() => {
     scanQrHelper().then(onBarScanned);
   }, [onBarScanned]);
@@ -393,13 +425,9 @@ const WalletsList: React.FC = () => {
       options.push(loc.wallets.paste_from_clipboard);
     }
 
-    const props = { title: loc.send.header, options, cancelButtonIndex: 0 };
-
     const anchor = findNodeHandle(walletActionButtonsRef.current);
-
-    if (anchor) {
-      options.push(String(anchor));
-    }
+    if (anchor === null) return;
+    const props = { title: loc.send.header, options, cancelButtonIndex: 0, anchor };
 
     ActionSheet.showActionSheetWithOptions(props, buttonIndex => {
       switch (buttonIndex) {
@@ -425,11 +453,39 @@ const WalletsList: React.FC = () => {
     });
   }, [onBarScanned, pasteFromClipboard]);
 
+  const renderScanButton = useCallback(() => {
+    if (wallets.length > 0) {
+      return (
+        <>
+          <FloatButtonsBottomFade />
+          <FContainer ref={walletActionButtonsRef}>
+            <FButton
+              onPress={onScanButtonPressed}
+              onLongPress={sendButtonLongPress}
+              icon={<Image resizeMode="stretch" source={scanImage} />}
+              text={loc.send.details_scan}
+              testID="HomeScreenScanButton"
+            />
+          </FContainer>
+        </>
+      );
+    } else {
+      return null;
+    }
+  }, [onScanButtonPressed, scanImage, sendButtonLongPress, wallets.length]);
+
+  const sectionListKeyExtractor = useCallback((item: WalletsListItem, index: number) => {
+    if (typeof item === 'string') return item;
+    const txKey = item?.hash || item?.txid;
+    if (txKey && item?.walletID) return `${txKey}_${item.walletID}`;
+    return txKey || `${item}${index}`;
+  }, []);
+
   const refreshProps = isDesktop || isElectrumDisabled ? {} : { refreshing: isLoading, onRefresh };
 
   const sections: SectionData[] = useMemo(() => {
     // On large screens, only show transactions section
-    if (sizeClass === SizeClass.Large) {
+    if (isWideLayout) {
       return [{ key: WalletsListSections.TRANSACTIONS, data: dataSource }];
     }
 
@@ -438,27 +494,22 @@ const WalletsList: React.FC = () => {
       { key: WalletsListSections.CAROUSEL, data: [WalletsListSections.CAROUSEL] },
       { key: WalletsListSections.TRANSACTIONS, data: dataSource },
     ];
-  }, [sizeClass, dataSource]);
+  }, [isWideLayout, dataSource]);
 
   // Constants for layout calculations
-  const TRANSACTION_ITEM_HEIGHT = 80;
-  const CAROUSEL_HEIGHT = 195;
-  const SECTION_HEADER_HEIGHT = 56; // Base height
-  const LARGE_TITLE_EXTRA_HEIGHT = 20; // Additional height for large titles
-
   const getSectionHeaderHeight = useCallback(() => {
-    return SECTION_HEADER_HEIGHT + (sizeClass === SizeClass.Large ? LARGE_TITLE_EXTRA_HEIGHT : 0);
-  }, [sizeClass]);
+    return sectionHeaderHeight + (isWideLayout ? Math.round(20 * fontScale) : 0);
+  }, [isWideLayout, sectionHeaderHeight, fontScale]);
 
   const getItemLayout = useCallback(
-    (data: any, index: number) => {
+    (_: unknown, index: number) => {
       const headerHeight = getSectionHeaderHeight();
 
-      if (sizeClass === SizeClass.Large) {
+      if (isWideLayout) {
         // On large screens: only transaction items, no carousel
         return {
-          length: TRANSACTION_ITEM_HEIGHT,
-          offset: TRANSACTION_ITEM_HEIGHT * index,
+          length: transactionItemHeight,
+          offset: transactionItemHeight * index,
           index,
         };
       } else {
@@ -466,7 +517,7 @@ const WalletsList: React.FC = () => {
         // First section: Carousel
         if (index === 0) {
           return {
-            length: CAROUSEL_HEIGHT,
+            length: carouselHeight,
             offset: 0,
             index,
           };
@@ -479,29 +530,33 @@ const WalletsList: React.FC = () => {
         // 3. Transaction items
         const transactionIndex = index - 1; // Adjust index to account for carousel
         return {
-          length: TRANSACTION_ITEM_HEIGHT,
-          offset: CAROUSEL_HEIGHT + headerHeight + TRANSACTION_ITEM_HEIGHT * transactionIndex,
+          length: transactionItemHeight,
+          offset: carouselHeight + headerHeight + transactionItemHeight * transactionIndex,
           index,
         };
       }
     },
-    [sizeClass, getSectionHeaderHeight],
+    [isWideLayout, getSectionHeaderHeight, carouselHeight, transactionItemHeight],
   );
 
   return (
     <>
-      <SafeAreaSectionList<any | string, SectionData>
+      <SafeAreaSectionList<WalletsListItem, SectionData>
+        testID="Wallets"
         renderItem={renderSectionItem}
         keyExtractor={sectionListKeyExtractor}
         renderSectionHeader={renderSectionHeader}
         initialNumToRender={10}
         renderSectionFooter={renderSectionFooter}
         sections={sections}
-        floatingButtonHeight={70}
+        extraData={wallets}
+        floatingButtonHeight={floatingButtonHeight}
         maxToRenderPerBatch={10}
         updateCellsBatchingPeriod={50}
         getItemLayout={getItemLayout}
         ignoreTopInset={true} // Ignore top inset as the screen header already handles it
+        // On iOS 26+, let the section headers scroll naturally with the content rather than sticking
+        stickySectionHeadersEnabled={!isIOS26OrHigher}
         {...refreshProps}
       />
       {renderScanButton()}
@@ -524,6 +579,7 @@ const styles = StyleSheet.create({
     fontSize: 24,
     marginVertical: 16,
     flexWrap: 'wrap',
+    flexShrink: 1,
   },
   footerRoot: {
     top: 80,

@@ -1,9 +1,9 @@
 import React, { useEffect } from 'react';
-import { RouteProp, useRoute } from '@react-navigation/native';
+import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
 import BigNumber from 'bignumber.js';
 import LottieView from 'lottie-react-native';
 import { StyleSheet, Text, View } from 'react-native';
-import { BlueCard } from '../../BlueComponents';
+import BlueCard from '../../components/BlueCard';
 import Button from '../../components/Button';
 import SafeArea from '../../components/SafeArea';
 import { useTheme } from '../../components/themes';
@@ -13,15 +13,18 @@ import HandOffComponent from '../../components/HandOffComponent';
 import { HandOffActivityType } from '../../components/types';
 import { useSettings } from '../../hooks/context/useSettings';
 import { SendDetailsStackParamList } from '../../navigation/SendDetailsStackParamList.ts';
-import { popToTop } from '../../NavigationService.ts';
+import { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList.ts';
 
 type RouteProps = RouteProp<SendDetailsStackParamList, 'Success'>;
+type NavigationProps = NativeStackNavigationProp<SendDetailsStackParamList, 'Success'>;
 
 const Success = () => {
   const { colors } = useTheme();
   const { selectedBlockExplorer } = useSettings();
   const route = useRoute<RouteProps>();
-  const { amount, fee, amountUnit = BitcoinUnit.BTC, invoiceDescription = '', txid } = route.params || {};
+  const navigation = useNavigation<NavigationProps>();
+  const { amount, fee, amountUnit = BitcoinUnit.BTC, invoiceDescription = '', txid, walletID, walletType } = route.params || {};
   const stylesHook = StyleSheet.create({
     root: {
       backgroundColor: colors.elevated,
@@ -35,8 +38,15 @@ const Success = () => {
   });
 
   const onDonePressed = () => {
-    // @ts-ignore idk
-    popToTop();
+    // Close SendDetails modal stack and return to the underlying wallet view.
+    if (walletID && walletType) {
+      (navigation as NativeStackNavigationProp<DetailViewStackParamList>).popTo('WalletTransactions', {
+        walletID,
+        walletType,
+      });
+      return;
+    }
+    navigation.getParent()?.goBack();
   };
 
   useEffect(() => {
@@ -68,9 +78,10 @@ interface SuccessViewParam {
   fee?: number;
   invoiceDescription?: string;
   shouldAnimate?: boolean;
+  children?: React.ReactNode;
 }
 
-export const SuccessView = ({ amount, amountUnit, fee, invoiceDescription, shouldAnimate = true }: SuccessViewParam) => {
+export const SuccessView = ({ amount, amountUnit, fee, invoiceDescription, shouldAnimate = true, children }: SuccessViewParam) => {
   const { colors } = useTheme();
 
   let unit: string = '';
@@ -134,9 +145,10 @@ export const SuccessView = ({ amount, amountUnit, fee, invoiceDescription, shoul
               color: colors.successCheck,
             },
           ]}
-          resizeMode="center"
+          resizeMode="contain"
         />
       </View>
+      {children ? <View style={styles.children}>{children}</View> : null}
     </View>
   );
 };
@@ -184,8 +196,15 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     marginBottom: 53,
   },
+  // bluenice.json is 550x400, drawn 1:1 over a 200x200 footprint
   lottie: {
-    width: 200,
-    height: 200,
+    width: 550,
+    height: 400,
+    marginHorizontal: -175,
+    marginVertical: -100,
+  },
+  children: {
+    // lottie (200px) is taller than `ready` with its margin (120 + 53), start below it so sparks do not cover the text
+    marginTop: 27,
   },
 });

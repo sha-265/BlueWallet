@@ -1,11 +1,15 @@
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
+import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
+import type { ParamListBase } from '@react-navigation/native';
 import React, { lazy } from 'react';
 import navigationStyle, { CloseButtonPosition } from '../components/navigationStyle';
 import { useTheme } from '../components/themes';
 import loc from '../loc';
 import { withLazySuspense } from './LazyLoadingIndicator';
+import { navigationGuardRouter } from './navigationGuard';
+import { LNDCreateInvoiceStackParamList } from './LNDStackParamsList';
 
-const Stack = createNativeStackNavigator();
+const Stack = createNativeStackNavigator<LNDCreateInvoiceStackParamList>();
 
 const LNDCreateInvoice = lazy(() => import('../screen/lnd/lndCreateInvoice'));
 const SelectWallet = lazy(() => import('../screen/wallets/SelectWallet'));
@@ -23,7 +27,7 @@ const LNDCreateInvoiceRoot = () => {
   const theme = useTheme();
 
   return (
-    <Stack.Navigator screenOptions={{ headerShadowVisible: false }}>
+    <Stack.Navigator screenOptions={{ headerShadowVisible: false }} UNSTABLE_router={navigationGuardRouter}>
       <Stack.Screen
         name="LNDCreateInvoice"
         component={LNDCreateInvoiceComponent}
@@ -44,6 +48,10 @@ const LNDCreateInvoiceRoot = () => {
         component={LNDViewInvoiceComponent}
         options={navigationStyle({
           headerTitle: loc.lndViewInvoice.lightning_invoice,
+          closeButtonPosition: CloseButtonPosition.Right,
+          onCloseButtonPressed: ({ navigation }) => navigation.getParent<NativeStackNavigationProp<ParamListBase>>()?.pop(),
+          headerBackVisible: false,
+          gestureEnabled: false,
           headerStyle: {
             backgroundColor: theme.colors.customHeader,
           },

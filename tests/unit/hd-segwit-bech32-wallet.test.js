@@ -1,7 +1,7 @@
 import assert from 'assert';
 import * as bitcoin from 'bitcoinjs-lib';
 
-import { HDSegwitBech32Wallet } from '../../class';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
 import { uint8ArrayToHex } from '../../blue_modules/uint8array-extras';
 
 describe('Bech32 Segwit HD (BIP84)', () => {
@@ -296,8 +296,9 @@ describe('Bech32 Segwit HD (BIP84)', () => {
     // console.log(outputs);
 
     const actualFeerate = Number(psbt.getFee()) / tx.virtualSize();
+    // we overpay for ~5 vbytes here: bech32 target and change outputs are overestimated, see #8932
     assert.strictEqual(
-      Math.round(actualFeerate) >= 150 && actualFeerate < 151,
+      actualFeerate >= 150 && actualFeerate < 155,
       true,
       `bad feerate, got ${actualFeerate}, expected at least 11; fee: ${psbt.getFee()}; virsualSize: ${tx.virtualSize()} vbytes; ${tx.toHex()}`,
     );

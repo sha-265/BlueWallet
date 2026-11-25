@@ -1,0 +1,12 @@
+[project]
+name = "apk-compare"
+version = "0.1.0"
+description = "A utility that compares APKs."
+requires-python = ">=3.12"
+dependencies = ["androguard>=4.1.3", "loguru>=0.7.3"]
+
+[project.optional-dependencies]
+dev = ["pytest>=9.1.1"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

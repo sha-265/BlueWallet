@@ -4,17 +4,18 @@ import { ActivityIndicator, Keyboard, Linking, StyleSheet, TextInput, View, Text
 
 import * as BlueElectrum from '../../blue_modules/BlueElectrum';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
-import { HDSegwitBech32Wallet } from '../../class';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
 import presentAlert from '../../components/Alert';
 import Button from '../../components/Button';
 import { useTheme } from '../../components/themes';
-import { platformSizing, platformLayout, getSettingsRowBackgroundColor, SettingsScrollView } from '../../components/platform';
+import { SettingsSection, SettingsScrollView, settingsCardContent } from '../../components/SettingsSection';
 import loc from '../../loc';
 import { useSettings } from '../../hooks/context/useSettings';
 import { majorTomToGroundControl } from '../../blue_modules/notifications';
 import { scanQrHelper } from '../../helpers/scan-qr';
 import { BlueSpacing10, BlueSpacing20 } from '../../components/BlueSpacing';
 import { BlueBigCheckmark } from '../../components/BlueBigCheckmark';
+import { errorMessage } from '../../helpers/errorMessage';
 
 const BROADCAST_RESULT = Object.freeze({
   none: 'Input transaction hex',
@@ -26,58 +27,9 @@ const BROADCAST_RESULT = Object.freeze({
 const Broadcast: React.FC = () => {
   const [tx, setTx] = useState<string | undefined>();
   const [txHex, setTxHex] = useState<string | undefined>();
-  const { colors, dark } = useTheme();
-  const sizing = platformSizing;
-  const layout = platformLayout;
+  const { colors } = useTheme();
   const [broadcastResult, setBroadcastResult] = useState<string>(BROADCAST_RESULT.none);
   const { selectedBlockExplorer } = useSettings();
-  const rowBackgroundColor = getSettingsRowBackgroundColor(colors, dark);
-
-  const styles = StyleSheet.create({
-    contentContainer: {
-      flex: 1,
-      paddingHorizontal: sizing.contentContainerPaddingHorizontal || 0,
-    },
-    contentWrapper: {
-      paddingTop: sizing.firstSectionContainerPaddingTop,
-      marginHorizontal: sizing.contentContainerMarginHorizontal || 0,
-      marginBottom: sizing.sectionContainerMarginBottom,
-      backgroundColor: rowBackgroundColor,
-      borderRadius: sizing.containerBorderRadius,
-      padding: sizing.basePadding,
-      ...layout.cardShadow,
-    },
-    topFormRow: {
-      flexDirection: 'row',
-      alignItems: 'center',
-      justifyContent: 'space-between',
-      paddingBottom: 10,
-      paddingTop: 0,
-      marginBottom: 10,
-    },
-    labelText: {
-      color: colors.foregroundColor,
-      fontSize: sizing.subtitleFontSize,
-      fontWeight: '500',
-    },
-    input: {
-      flexDirection: 'row',
-      borderWidth: 1,
-      borderBottomWidth: 0.5,
-      alignItems: 'center',
-      borderRadius: 4,
-      borderColor: colors.formBorder,
-      borderBottomColor: colors.formBorder,
-      backgroundColor: colors.inputBackgroundColor,
-    },
-    text: {
-      flex: 1,
-      padding: 8,
-      color: colors.foregroundColor,
-      maxHeight: 100,
-      minHeight: 100,
-    },
-  });
 
   const handleScannedData = useCallback((scannedData: string) => {
     if (scannedData.indexOf('+') === -1 && scannedData.indexOf('=') === -1 && scannedData.indexOf('=') === -1) {
@@ -98,8 +50,9 @@ const Broadcast: React.FC = () => {
     Keyboard.dismiss();
     setBroadcastResult(BROADCAST_RESULT.pending);
     try {
-      await BlueElectrum.ping();
-      await BlueElectrum.waitTillConnected();
+      if (!(await BlueElectrum.ensureConnected())) {
+        throw new Error(loc.errors.network);
+      }
       const walletObj = new HDSegwitBech32Wallet();
       if (txHex) {
         const result = await walletObj.broadcastTx(txHex);
@@ -115,8 +68,8 @@ const Broadcast: React.FC = () => {
           setBroadcastResult(BROADCAST_RESULT.error);
         }
       }
-    } catch (error: any) {
-      presentAlert({ title: loc.errors.error, message: error.message });
+    } catch (error) {
+      presentAlert({ title: loc.errors.error, message: errorMessage(error) });
       triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
       setBroadcastResult(BROADCAST_RESULT.error);
     }
@@ -148,51 +101,53 @@ const Broadcast: React.FC = () => {
   }
 
   return (
-    <SettingsScrollView style={styles.contentContainer} testID="BroadcastView">
-      <View style={styles.contentWrapper}>
-        {BROADCAST_RESULT.success !== broadcastResult && (
-          <>
-            <View style={styles.topFormRow}>
-              <Text style={styles.labelText}>{status}</Text>
-              {BROADCAST_RESULT.pending === broadcastResult && <ActivityIndicator size="small" />}
-            </View>
+    <SettingsScrollView testID="BroadcastView" automaticallyAdjustKeyboardInsets>
+      <SettingsSection>
+        <View style={settingsCardContent}>
+          {BROADCAST_RESULT.success !== broadcastResult && (
+            <>
+              <View style={styles.topFormRow}>
+                <Text style={[styles.labelText, { color: colors.foregroundColor }]}>{status}</Text>
+                {BROADCAST_RESULT.pending === broadcastResult && <ActivityIndicator size="small" />}
+              </View>
 
-            <View
-              style={[
-                styles.input,
-                { borderColor: colors.formBorder, borderBottomColor: colors.formBorder, backgroundColor: colors.inputBackgroundColor },
-              ]}
-            >
-              <TextInput
-                style={[styles.text, { color: colors.foregroundColor }]}
-                multiline
-                editable
-                placeholderTextColor={colors.placeholderTextColor}
-                value={txHex}
-                onChangeText={handleUpdateTxHex}
-                onSubmitEditing={Keyboard.dismiss}
-                testID="TxHex"
+              <View
+                style={[
+                  styles.input,
+                  { borderColor: colors.formBorder, borderBottomColor: colors.formBorder, backgroundColor: colors.inputBackgroundColor },
+                ]}
+              >
+                <TextInput
+                  style={[styles.text, { color: colors.foregroundColor }]}
+                  multiline
+                  editable
+                  placeholderTextColor={colors.placeholderTextColor}
+                  value={txHex}
+                  onChangeText={handleUpdateTxHex}
+                  onSubmitEditing={Keyboard.dismiss}
+                  testID="TxHex"
+                />
+              </View>
+
+              <BlueSpacing20 />
+
+              <Button
+                title={loc.send.broadcastButton}
+                onPress={handleBroadcast}
+                disabled={broadcastResult === BROADCAST_RESULT.pending || txHex?.length === 0 || txHex === undefined}
+                testID="BroadcastButton"
               />
-            </View>
 
-            <BlueSpacing20 />
+              <BlueSpacing10 />
 
-            <Button
-              title={loc.send.broadcastButton}
-              onPress={handleBroadcast}
-              disabled={broadcastResult === BROADCAST_RESULT.pending || txHex?.length === 0 || txHex === undefined}
-              testID="BroadcastButton"
-            />
+              <Button title={loc.multisig.scan_or_open_file} onPress={handleQRScan} />
 
-            <BlueSpacing10 />
-
-            <Button title={loc.multisig.scan_or_open_file} onPress={handleQRScan} />
-
-            <BlueSpacing20 />
-          </>
-        )}
-        {BROADCAST_RESULT.success === broadcastResult && tx && <SuccessScreen tx={tx} url={`${selectedBlockExplorer.url}/tx/${tx}`} />}
-      </View>
+              <BlueSpacing20 />
+            </>
+          )}
+          {BROADCAST_RESULT.success === broadcastResult && tx && <SuccessScreen tx={tx} url={`${selectedBlockExplorer.url}/tx/${tx}`} />}
+        </View>
+      </SettingsSection>
     </SettingsScrollView>
   );
 };
@@ -218,6 +173,31 @@ const SuccessScreen: React.FC<{ tx: string; url: string }> = ({ tx, url }) => {
 export default Broadcast;
 
 const styles = StyleSheet.create({
+  topFormRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingBottom: 10,
+    paddingTop: 0,
+    marginBottom: 10,
+  },
+  labelText: {
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  input: {
+    flexDirection: 'row',
+    borderWidth: 1,
+    borderBottomWidth: 0.5,
+    alignItems: 'center',
+    borderRadius: 4,
+  },
+  text: {
+    flex: 1,
+    padding: 8,
+    maxHeight: 100,
+    minHeight: 100,
+  },
   successWrapper: {
     flexDirection: 'column',
     justifyContent: 'center',

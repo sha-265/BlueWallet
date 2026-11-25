@@ -1,0 +1,4 @@
+__pycache__
+.venv
+mismatches
+.pytest_cache

@@ -1,24 +1,23 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
-import { useNavigationState, useRoute, RouteProp } from '@react-navigation/native';
+import { useNavigation, useNavigationState, useRoute, RouteProp, StackActions } from '@react-navigation/native';
 import { ActivityIndicator, StyleSheet, View } from 'react-native';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
-import { BlueText } from '../../BlueComponents';
+import BlueText from '../../components/BlueText';
 import SafeArea from '../../components/SafeArea';
 import { useTheme } from '../../components/themes';
 import loc from '../../loc';
 import { Chain } from '../../models/bitcoinUnits';
 import { useStorage } from '../../hooks/context/useStorage';
-import WalletsCarousel from '../../components/WalletsCarousel';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
+import WalletsCarousel, { CarouselListRefType } from '../../components/WalletsCarousel';
 import { TWallet } from '../../class/wallets/types';
 import { pop } from '../../NavigationService';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { SendDetailsStackParamList } from '../../navigation/SendDetailsStackParamList';
+import { RootParamList } from '../../navigation/RootParamList';
 import { BlueSpacing20 } from '../../components/BlueSpacing';
 
-type NavigationProps = NativeStackNavigationProp<SendDetailsStackParamList, 'SelectWallet'>;
+type NavigationProps = NativeStackNavigationProp<RootParamList, 'SelectWallet'>;
 
-type RouteProps = RouteProp<SendDetailsStackParamList, 'SelectWallet'>;
+type RouteProps = RouteProp<RootParamList, 'SelectWallet'>;
 
 const SelectWallet: React.FC = () => {
   const route = useRoute<RouteProps>();
@@ -29,13 +28,13 @@ const SelectWallet: React.FC = () => {
     noWalletExplanationText,
     onChainRequireSend = false,
     selectedWalletID,
-  } = route.params;
+  } = route.params ?? {};
   const [isLoading, setIsLoading] = useState(true);
-  const navigation = useExtendedNavigation<NavigationProps>();
+  const navigation = useNavigation<NavigationProps>();
   const { wallets } = useStorage();
   const { colors } = useTheme();
   const isModal = useNavigationState(state => state.routes.length > 1);
-  const walletsCarousel = useRef<any>(null);
+  const walletsCarousel = useRef<CarouselListRefType>(null);
   const previousRouteName = useNavigationState(state => state.routes[state.routes.length - 2]?.name);
   const [filteredWallets, setFilteredWallets] = useState<TWallet[]>([]);
 
@@ -108,11 +107,9 @@ const SelectWallet: React.FC = () => {
   const onPress = (item: TWallet) => {
     triggerHapticFeedback(HapticFeedbackTypes.Selection);
     if (onWalletSelect) {
-      // @ts-ignore idk how to fix
       onWalletSelect(item, { navigation: { pop, navigate: navigation.navigate } });
     } else {
-      // @ts-ignore: fix later
-      navigation.popTo(previousRouteName, { walletID: item.getID(), merge: true });
+      navigation.dispatch(StackActions.popTo(previousRouteName, { walletID: item.getID() }, { merge: true }));
     }
   };
 

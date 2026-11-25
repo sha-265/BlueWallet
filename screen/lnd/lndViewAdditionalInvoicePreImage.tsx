@@ -2,21 +2,18 @@ import { RouteProp, useRoute } from '@react-navigation/native';
 import React from 'react';
 import { StyleSheet, View } from 'react-native';
 
-import { BlueTextCentered } from '../../BlueComponents';
+import BlueTextCentered from '../../components/BlueTextCentered';
 import CopyTextToClipboard from '../../components/CopyTextToClipboard';
-import QRCodeComponent from '../../components/QRCodeComponent';
+import QRCode from '../../components/QRCode';
 import SafeArea from '../../components/SafeArea';
 import { useTheme } from '../../components/themes';
 import loc from '../../loc';
 import { BlueSpacing20 } from '../../components/BlueSpacing';
-
-type LNDViewAdditionalInvoicePreImageRouteParams = {
-  preImageData: string;
-};
+import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
 
 const LNDViewAdditionalInvoicePreImage = () => {
   const { colors } = useTheme();
-  const { preImageData } = useRoute<RouteProp<{ params: LNDViewAdditionalInvoicePreImageRouteParams }, 'params'>>().params;
+  const { preImageData } = useRoute<RouteProp<DetailViewStackParamList, 'LNDViewAdditionalInvoicePreImage'>>().params;
   const stylesHook = StyleSheet.create({
     root: {
       backgroundColor: colors.elevated,
@@ -29,10 +26,12 @@ const LNDViewAdditionalInvoicePreImage = () => {
         <BlueTextCentered>{loc.lndViewInvoice.preimage}:</BlueTextCentered>
         <BlueSpacing20 />
         <View style={styles.qrCodeContainer}>
-          <QRCodeComponent value={preImageData} size={300} logoSize={90} />
+          <QRCode value={preImageData} size={300} logoSize={90} />
         </View>
         <BlueSpacing20 />
-        <CopyTextToClipboard text={preImageData} />
+        <View style={styles.copyText}>
+          <CopyTextToClipboard text={preImageData} />
+        </View>
       </View>
     </SafeArea>
   );
@@ -48,6 +47,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
     marginHorizontal: 16,
+  },
+  copyText: {
+    marginVertical: 32,
+    paddingHorizontal: 16,
   },
 });
 

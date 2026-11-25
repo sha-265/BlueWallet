@@ -1,10 +1,11 @@
+import { useNavigation } from '@react-navigation/native';
 import React from 'react';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
+
 import loc from '../../loc';
-import { SettingsScrollView, SettingsSection, SettingsListItem } from '../../components/platform';
+import { SettingsSection, SettingsListItem, SettingsScrollView } from '../../components/SettingsSection';
 
 const SettingsTools: React.FC = () => {
-  const navigation = useExtendedNavigation();
+  const navigation = useNavigation();
   const navigateToIsItMyAddress = () => {
     navigation.navigate('IsItMyAddress');
   };
@@ -17,32 +18,44 @@ const SettingsTools: React.FC = () => {
     navigation.navigate('GenerateWord');
   };
 
+  const navigateToManageWallets = () => {
+    navigation.navigate('ManageWallets');
+  };
+
   return (
     <SettingsScrollView>
-      <SettingsSection horizontalInset={false}>
+      <SettingsSection>
         <SettingsListItem
           title={loc.is_it_my_address.title}
           iconName="search"
           onPress={navigateToIsItMyAddress}
+          accessibilityLabel={loc.is_it_my_address.title}
           testID="IsItMyAddress"
           chevron
-          position="first"
         />
         <SettingsListItem
           title={loc.settings.network_broadcast}
           iconName="paperPlane"
           onPress={navigateToBroadcast}
+          accessibilityLabel={loc.settings.network_broadcast}
           testID="Broadcast"
           chevron
-          position="middle"
         />
         <SettingsListItem
           title={loc.autofill_word.title}
           iconName="key"
           onPress={navigateToGenerateWord}
+          accessibilityLabel={loc.autofill_word.title}
           testID="GenerateWord"
           chevron
-          position="last"
+        />
+        <SettingsListItem
+          title={loc.wallets.manage_title}
+          iconName="wallet"
+          onPress={navigateToManageWallets}
+          accessibilityLabel={loc.wallets.manage_title}
+          testID="ManageWallets"
+          bottomDivider={false}
         />
       </SettingsSection>
     </SettingsScrollView>

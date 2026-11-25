@@ -1,10 +1,14 @@
 import bolt11 from 'bolt11';
 import { BitcoinUnit, Chain } from '../../models/bitcoinUnits';
 import { fetch } from '../../util/fetch';
+import Lnurl from '../lnurl';
 import { LegacyWallet } from './legacy-wallet';
 import { DecodedInvoice, LightningTransaction, Transaction } from './types';
 
 const _staticDecodedInvoiceCache: Record<string, DecodedInvoice> = {};
+
+/** row as lndhub returns it; getTransactions() fills the display fields in place */
+type LndHubTx = LightningTransaction & { amount?: number; time?: number };
 
 export class LightningCustodianWallet extends LegacyWallet {
   static readonly type = 'lightningCustodianWallet';
@@ -12,8 +16,7 @@ export class LightningCustodianWallet extends LegacyWallet {
   static readonly subtitleReadable = 'LNDhub';
   // @ts-ignore: override
   public readonly type = LightningCustodianWallet.type;
-  // @ts-ignore: override
-  public readonly typeReadable = LightningCustodianWallet.typeReadable;
+  public readonly typeReadable: string = LightningCustodianWallet.typeReadable;
 
   baseURI?: string;
   refresh_token: string = '';
@@ -21,12 +24,12 @@ export class LightningCustodianWallet extends LegacyWallet {
   _refresh_token_created_ts: number = 0;
   _access_token_created_ts: number = 0;
   refill_addressess: string[] = [];
-  pending_transactions_raw: any[] = [];
-  transactions_raw: any[] = [];
-  user_invoices_raw: any[] = [];
+  pending_transactions_raw: LndHubTx[] = [];
+  transactions_raw: LndHubTx[] = [];
+  user_invoices_raw: LndHubTx[] = [];
   preferredBalanceUnit = BitcoinUnit.SATS;
   chain = Chain.OFFCHAIN;
-  last_paid_invoice_result?: any;
+  last_paid_invoice_result?: { payment_preimage?: string; payment_hash?: string; payment_request?: string };
 
   /**
    * requires calling init() after setting
@@ -41,10 +44,6 @@ export class LightningCustodianWallet extends LegacyWallet {
     return this.baseURI;
   }
 
-  allowSend() {
-    return true;
-  }
-
   getAddress(): string | false {
     if (this.refill_addressess.length > 0) {
       return this.refill_addressess[0];
@@ -55,10 +54,6 @@ export class LightningCustodianWallet extends LegacyWallet {
 
   getSecret() {
     return this.secret + '@' + this.baseURI;
-  }
-
-  timeToRefreshBalance() {
-    return (+new Date() - this._lastBalanceFetch) / 1000 > 300; // 5 min
   }
 
   timeToRefreshTransaction() {
@@ -159,15 +154,8 @@ export class LightningCustodianWallet extends LegacyWallet {
       // but the ones received later should overwrite older ones
 
       for (const oldInvoice of this.user_invoices_raw) {
-        // iterate all OLD invoices
-        let found = false;
-        for (const newInvoice of json) {
-          // iterate all NEW invoices
-          if (newInvoice.payment_request === oldInvoice.payment_request) found = true;
-        }
-
-        if (!found) {
-          // if old invoice is not found in NEW array, we simply add it:
+        // if old invoice is not found in NEW array, we simply add it:
+        if (!json.some((newInvoice: { payment_request: string }) => newInvoice.payment_request === oldInvoice.payment_request)) {
           json.push(oldInvoice);
         }
       }
@@ -231,14 +219,7 @@ export class LightningCustodianWallet extends LegacyWallet {
    * @return {Promise.<void>}
    */
   async authorize() {
-    let login, password;
-    if (this.secret.indexOf('blitzhub://') !== -1) {
-      login = this.secret.replace('blitzhub://', '').split(':')[0];
-      password = this.secret.replace('blitzhub://', '').split(':')[1];
-    } else {
-      login = this.secret.replace('lndhub://', '').split(':')[0];
-      password = this.secret.replace('lndhub://', '').split(':')[1];
-    }
+    const [login, password] = this.secret.replace(/^(blitzhub|lndhub):\/\//, '').split(':');
     const response = await fetch(this.baseURI + '/auth?type=auth', {
       method: 'POST',
       body: JSON.stringify({ login, password }),
@@ -353,8 +334,12 @@ export class LightningCustodianWallet extends LegacyWallet {
   }
 
   getTransactions(): (Transaction & LightningTransaction)[] {
-    let txs: any = [];
-    txs = txs.concat(this.pending_transactions_raw.slice(), this.transactions_raw.slice().reverse(), this.user_invoices_raw.slice()); // slice so array is cloned
+    // slice so array is cloned
+    const txs: LndHubTx[] = ([] as LndHubTx[]).concat(
+      this.pending_transactions_raw.slice(),
+      this.transactions_raw.slice().reverse(),
+      this.user_invoices_raw.slice(),
+    );
 
     for (const tx of txs) {
       tx.walletID = this.getID();
@@ -372,7 +357,7 @@ export class LightningCustodianWallet extends LegacyWallet {
 
       if (tx.type === 'paid_invoice') {
         tx.memo = tx.memo || 'Lightning payment';
-        if (tx.value > 0) tx.value = tx.value * -1; // value already includes fee in it (see lndhub)
+        if (tx.value !== undefined && tx.value > 0) tx.value = tx.value * -1; // value already includes fee in it (see lndhub)
         // outer code expects spending transactions to of negative value
       }
 
@@ -382,16 +367,15 @@ export class LightningCustodianWallet extends LegacyWallet {
 
       if (tx.type === 'user_invoice') {
         // incoming ln tx
-        tx.value = parseInt(tx.amt, 10);
+        tx.value = parseInt(String(tx.amt), 10);
         tx.fee = 0;
         tx.memo = tx.description || 'Lightning invoice';
       }
 
-      tx.timestamp = tx.timestamp || tx.time;
+      if (!tx.timestamp && tx.time) tx.timestamp = tx.time;
     }
-    return txs.sort(function (a: { timestamp: number }, b: { timestamp: number }) {
-      return b.timestamp - a.timestamp;
-    });
+    // rows carry only the lightning fields; callers treat them as the on-chain shape too. rows with no date sort last
+    return txs.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)) as (Transaction & LightningTransaction)[];
   }
 
   async fetchPendingTransactions() {
@@ -526,7 +510,7 @@ export class LightningCustodianWallet extends LegacyWallet {
       const { tagName, data } = tags[i];
       switch (tagName) {
         case 'payment_hash':
-          decoded.payment_hash = String(data);
+          decoded.payment_hash ||= String(data);
           break;
         case 'purpose_commit_hash':
           decoded.description_hash = String(data);
@@ -574,10 +558,6 @@ export class LightningCustodianWallet extends LegacyWallet {
       throw new Error('API error: ' + json.message + ' (code ' + json.code + ')');
     }
 
-    return true;
-  }
-
-  allowReceive() {
     return true;
   }
 
@@ -637,8 +617,12 @@ export class LightningCustodianWallet extends LegacyWallet {
     return false;
   }
 
-  authenticate(lnurl: any) {
-    return lnurl.authenticate(this.secret);
+  allowLnurlAuth() {
+    return true;
+  }
+
+  getLnurlAuthLinkingKey(domain: string): Uint8Array {
+    return Lnurl.legacyLinkingKey(this.secret, domain);
   }
 
   getLatestTransactionTime(): string | 0 {
@@ -646,7 +630,7 @@ export class LightningCustodianWallet extends LegacyWallet {
     if (transactions.length === 0) {
       return 0;
     }
-    return new Date(transactions.reduce((max: number, tx: any) => Math.max(max, tx.timestamp), 0) * 1000).toString();
+    return new Date(transactions.reduce((max, tx) => Math.max(max, tx.timestamp), 0) * 1000).toString();
   }
 
   isInvoiceExpired(invoice: string, currentTimestamp?: number): boolean {

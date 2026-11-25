@@ -1,8 +1,9 @@
 import { bech32 } from 'bech32';
+import { BIP32Interface } from 'bip32';
 import bolt11 from 'bolt11';
 import { sha256 } from '@noble/hashes/sha256';
 import { hmac } from '@noble/hashes/hmac';
-import CryptoJS from 'crypto-js';
+import { cbc } from '@noble/ciphers/aes';
 import ecc from '../blue_modules/noble_ecc';
 import { parse } from 'url'; // eslint-disable-line n/no-deprecated-api
 import { fetch } from '../util/fetch';
@@ -10,7 +11,7 @@ import { base64ToUint8Array, hexToUint8Array, uint8ArrayToHex, uint8ArrayToStrin
 
 const ONION_REGEX = /^(http:\/\/[^/:@]+\.onion(?::\d{1,5})?)(\/.*)?$/; // regex for onion URL
 
-interface LnurlPayServicePayload {
+export interface LnurlPayServicePayload {
   callback: string;
   fixed: boolean;
   min: number;
@@ -23,16 +24,46 @@ interface LnurlPayServicePayload {
   commentAllowed?: number;
 }
 
+/** LUD-09 */
+export type LnurlSuccessAction =
+  | { tag: 'message'; message: string }
+  | { tag: 'url'; description: string; url: string }
+  | { tag: 'aes'; description: string; ciphertext: string; iv: string };
+
 interface LnurlPayServiceBolt11Payload {
   pr: string;
-  successAction?: any;
+  successAction?: LnurlSuccessAction;
   disposable?: boolean;
   tag: string;
-  metadata: any;
+  metadata: string;
   minSendable: number;
   maxSendable: number;
   callback: string;
   commentAllowed: number;
+}
+
+export type LnurlAuthAction = 'register' | 'login' | 'link' | 'auth';
+
+const LNURL_AUTH_ACTIONS: readonly LnurlAuthAction[] = ['register', 'login', 'link', 'auth'];
+
+export interface LnurlAuthParams {
+  href: string;
+  domain: string;
+  k1: string;
+  action: LnurlAuthAction;
+}
+
+/**
+ * `{"status": "ERROR", "reason": "..."}` reply from LNURL service. `reason` is text from the service, so it can be shown to the user
+ */
+export class LnurlServerError extends Error {
+  reason: string;
+
+  constructor(reason: string) {
+    super('Reply from server: ' + reason);
+    this.name = 'LnurlServerError';
+    this.reason = reason;
+  }
 }
 
 interface DecodedInvoice {
@@ -41,13 +72,18 @@ interface DecodedInvoice {
   num_millisatoshis: string;
   timestamp: string;
   fallback_addr: string;
-  route_hints: any[];
+  route_hints: unknown[];
   payment_hash?: string;
   description_hash?: string;
   cltv_expiry?: string;
   expiry?: string;
   description?: string;
 }
+
+type LnurlStorage = {
+  getItem(key: string): Promise<string | null>;
+  setItem(key: string, value: string): Promise<void>;
+};
 
 /**
  * @see https://github.com/btcontract/lnurl-rfc/blob/master/lnurl-pay.md
@@ -60,10 +96,10 @@ export default class Lnurl {
   private _lnurl: string;
   private _lnurlPayServiceBolt11Payload: LnurlPayServiceBolt11Payload | false;
   private _lnurlPayServicePayload: LnurlPayServicePayload | false;
-  private _AsyncStorage: any;
+  private _AsyncStorage: LnurlStorage | undefined;
   private _preimage: string | false;
 
-  constructor(url: string | false, AsyncStorage?: any) {
+  constructor(url: string | false, AsyncStorage?: LnurlStorage) {
     this._lnurl = url || '';
     this._lnurlPayServiceBolt11Payload = false;
     this._lnurlPayServicePayload = false;
@@ -111,14 +147,19 @@ export default class Lnurl {
     return [baseURI, path];
   }
 
-  async fetchGet(url: string): Promise<any> {
+  async fetchGet<T = unknown>(url: string): Promise<T> {
     const resp = await fetch(url, { method: 'GET' });
     if (resp.status >= 300) {
+      // some services send the error reason with an HTTP error status
+      const errorReply = await resp.json().catch(() => undefined);
+      if (typeof errorReply?.reason === 'string') {
+        throw new LnurlServerError(errorReply.reason);
+      }
       throw new Error('Bad response from server');
     }
     const reply = await resp.json();
     if (reply.status === 'ERROR') {
-      throw new Error('Reply from server: ' + reply.reason);
+      throw new LnurlServerError(String(reply.reason ?? ''));
     }
     return reply;
   }
@@ -139,7 +180,7 @@ export default class Lnurl {
       const { tagName, data } = tags[i];
       switch (tagName) {
         case 'payment_hash':
-          decoded.payment_hash = String(data);
+          decoded.payment_hash ||= String(data);
           break;
         case 'purpose_commit_hash':
           decoded.description_hash = String(data);
@@ -185,7 +226,7 @@ export default class Lnurl {
     if (comment) comment = `&comment=${encodeURIComponent(comment)}`;
     const urlToFetch =
       this._lnurlPayServicePayload.callback + separator + 'amount=' + Math.floor(amountSat * 1000) + '&nonce=' + nonce + comment;
-    this._lnurlPayServiceBolt11Payload = (await this.fetchGet(urlToFetch)) as LnurlPayServiceBolt11Payload;
+    this._lnurlPayServiceBolt11Payload = await this.fetchGet<LnurlPayServiceBolt11Payload>(urlToFetch);
 
     // check pr description_hash, amount etc:
     const decoded = this.decodeInvoice(this._lnurlPayServiceBolt11Payload.pr);
@@ -205,7 +246,7 @@ export default class Lnurl {
     const url = Lnurl.getUrlFromLnurl(this._lnurl);
     if (!url) throw new Error('Invalid LNURL');
     // calling the url
-    const reply = (await this.fetchGet(url)) as LnurlPayServiceBolt11Payload;
+    const reply = await this.fetchGet<LnurlPayServiceBolt11Payload>(url);
 
     if (reply.tag !== Lnurl.TAG_PAY_REQUEST) {
       throw new Error('lnurl-pay expected, found tag ' + reply.tag);
@@ -255,8 +296,9 @@ export default class Lnurl {
     if (!paymentHash) throw new Error('No paymentHash provided');
     let data;
     try {
-      data = await this._AsyncStorage.getItem('lnurlpay_success_data_' + paymentHash);
-      data = JSON.parse(data);
+      const raw = await this._AsyncStorage?.getItem('lnurlpay_success_data_' + paymentHash);
+      if (!raw) return false;
+      data = JSON.parse(raw);
     } catch (_) {
       return false;
     }
@@ -277,6 +319,7 @@ export default class Lnurl {
     }
     this._preimage = preimage;
 
+    if (!this._AsyncStorage) throw new Error('Lnurl: no storage to save the payment');
     await this._AsyncStorage.setItem(
       'lnurlpay_success_data_' + paymentHash,
       JSON.stringify({
@@ -288,7 +331,7 @@ export default class Lnurl {
     );
   }
 
-  getSuccessAction(): any | undefined {
+  getSuccessAction(): LnurlSuccessAction | undefined {
     return this._lnurlPayServiceBolt11Payload && 'successAction' in this._lnurlPayServiceBolt11Payload
       ? this._lnurlPayServiceBolt11Payload.successAction
       : undefined;
@@ -321,13 +364,24 @@ export default class Lnurl {
   }
 
   static decipherAES(ciphertextBase64: string, preimageHex: string, ivBase64: string): string {
-    const iv = CryptoJS.enc.Base64.parse(ivBase64);
-    const key = CryptoJS.enc.Hex.parse(preimageHex);
-    return CryptoJS.AES.decrypt(uint8ArrayToHex(base64ToUint8Array(ciphertextBase64)), key, {
-      iv,
-      mode: CryptoJS.mode.CBC,
-      format: CryptoJS.format.Hex,
-    }).toString(CryptoJS.enc.Utf8);
+    // crypto-js's old implementation silently returned '' on malformed
+    // ciphertext (non-16-aligned bytes, bad PKCS7 padding) and threw on
+    // malformed UTF-8 plaintext. @noble/ciphers throws on the former. We
+    // catch every throw and return '' — the call site at
+    // screen/lnd/lnurlPaySuccess.tsx renders this directly without a
+    // try/catch, so a misbehaving LNURL server should not crash the screen.
+    // Note: unlike crypto-js's strict `enc.Utf8` decoder, `uint8ArrayToString`
+    // is lenient on bad UTF-8 (mojibake instead of throw); this is strictly
+    // safer than the old behaviour for this user-facing path.
+    try {
+      const key = hexToUint8Array(preimageHex);
+      const iv = base64ToUint8Array(ivBase64);
+      const ct = base64ToUint8Array(ciphertextBase64);
+      const pt = cbc(key, iv).decrypt(ct);
+      return uint8ArrayToString(pt);
+    } catch (_) {
+      return '';
+    }
   }
 
   getCommentAllowed(): number | false {
@@ -349,27 +403,101 @@ export default class Lnurl {
     return this.getMin();
   }
 
-  async authenticate(secret: string): Promise<void> {
-    if (!this._lnurl) throw new Error('this._lnurl is not set');
+  /**
+   * @see https://github.com/lnurl/luds/blob/luds/04.md
+   */
+  static isLnurlAuth(text: string): boolean {
+    if (!Lnurl.isLnurl(text)) return false;
+    try {
+      return parse(Lnurl.getUrlFromLnurl(text) || '', true).query.tag === Lnurl.TAG_LOGIN_REQUEST;
+    } catch (_) {
+      return false;
+    }
+  }
 
-    const url = parse(Lnurl.getUrlFromLnurl(this._lnurl) || '', true);
+  /**
+   * Validates LNURL-auth request (LUD-04) and extracts everything needed to sign it
+   */
+  static parseAuthUrl(lnurl: string): LnurlAuthParams {
+    const url = parse(Lnurl.getUrlFromLnurl(lnurl) || '', true);
+    const { tag, k1, action = 'auth' } = url.query;
 
-    if (!url.hostname) {
+    if (tag !== Lnurl.TAG_LOGIN_REQUEST) {
+      throw new Error('lnurl-auth expected, found tag ' + tag);
+    }
+
+    // LUD-05: FQDN with last full-stop omitted
+    const domain = (url.hostname || '').replace(/\.$/, '');
+    if (!domain) {
       throw new Error('Invalid URL: hostname is null');
     }
 
-    const privateKey = hmac(sha256, secret, url.hostname);
-    const publicKey = ecc.pointFromScalar(privateKey);
+    if (url.protocol !== 'https:' && !(url.protocol === 'http:' && domain.endsWith('.onion'))) {
+      throw new Error('Invalid URL: must be https or onion');
+    }
+
+    if (typeof k1 !== 'string' || !/^[0-9a-f]{64}$/i.test(k1)) {
+      throw new Error('Invalid k1');
+    }
+
+    // unknown actions (e.g. "signup") are not rejected: the signature is the same, only the prompt differs, so show the login prompt like Valet
+    const normalizedAction = typeof action === 'string' ? action.toLowerCase() : '';
+    const authAction = LNURL_AUTH_ACTIONS.includes(normalizedAction as LnurlAuthAction) ? (normalizedAction as LnurlAuthAction) : 'login';
+
+    return { href: url.href, domain, k1, action: authAction };
+  }
+
+  /**
+   * Linking key derivation used by LNDHub wallets before LUD-05 support. Kept so existing
+   * accounts on services stay accessible.
+   */
+  static legacyLinkingKey(secret: string, domain: string): Uint8Array {
+    return hmac(sha256, secret, domain);
+  }
+
+  /**
+   * @see https://github.com/lnurl/luds/blob/luds/05.md
+   */
+  static lud05PathSuffix(hashingKey: Uint8Array, domain: string): number[] {
+    const material = hmac(sha256, hashingKey, domain);
+    const view = new DataView(material.buffer, material.byteOffset, 16);
+    return [0, 4, 8, 12].map(offset => view.getUint32(offset, false));
+  }
+
+  /**
+   * Indexes of 2^31 and above are derived as hardened, same as other LUD-05 implementations,
+   * so they must not be masked.
+   *
+   * @see https://github.com/lnurl/luds/blob/luds/05.md
+   */
+  static lud05LinkingKey(root: BIP32Interface, domain: string): Uint8Array {
+    const hashingKey = root.derivePath("m/138'/0").privateKey;
+    if (!hashingKey) {
+      throw new Error('LNURL-auth requires a private key');
+    }
+
+    const node = Lnurl.lud05PathSuffix(hashingKey, domain).reduce((parent, index) => parent.derive(index), root.derivePath("m/138'"));
+    if (!node.privateKey) {
+      throw new Error('LNURL-auth requires a private key');
+    }
+
+    return node.privateKey;
+  }
+
+  async authenticate(linkingKey: Uint8Array): Promise<void> {
+    if (!this._lnurl) throw new Error('this._lnurl is not set');
+
+    const { href, k1 } = Lnurl.parseAuthUrl(this._lnurl);
+
+    const publicKey = ecc.pointFromScalar(linkingKey);
     if (!publicKey) {
       throw new Error('Failed to generate public key');
     }
-    const signature = ecc.signDER(hexToUint8Array(url.query.k1 as string), privateKey);
+    const signature = ecc.signDER(hexToUint8Array(k1), linkingKey);
 
-    const reply = await this.fetchGet(`${url.href}&sig=${uint8ArrayToHex(signature)}&key=${uint8ArrayToHex(publicKey)}`);
-    if (reply.status === 'OK') {
-      // Authentication successful
-    } else {
-      throw reply.reason;
+    const reply = await this.fetchGet<{ status: string }>(`${href}&sig=${uint8ArrayToHex(signature)}&key=${uint8ArrayToHex(publicKey)}`);
+    if (reply?.status !== 'OK') {
+      throw new Error('Unexpected reply from server');
     }
   }
 

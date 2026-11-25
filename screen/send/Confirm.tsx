@@ -1,12 +1,13 @@
-import React, { useEffect, useMemo, useReducer } from 'react';
-import { ActivityIndicator, FlatList, TouchableOpacity, StyleSheet, Switch, Text, View } from 'react-native';
-import { PayjoinClient } from 'payjoin-client';
+import React, { useCallback, useEffect, useMemo, useReducer, useRef } from 'react';
+import { ActivityIndicator, FlatList, Pressable, StyleSheet, Switch, Text, View } from 'react-native';
 import BigNumber from 'bignumber.js';
 import * as bitcoin from 'bitcoinjs-lib';
-import { BlueText, BlueCard } from '../../BlueComponents';
+import BlueCard from '../../components/BlueCard';
+import { formatTransactionOutput } from '../../helpers/formatTransactionOutput';
+import BlueText from '../../components/BlueText';
 import { BitcoinUnit } from '../../models/bitcoinUnits';
 import loc, { formatBalance, formatBalanceWithoutSuffix } from '../../loc';
-import { useRoute, RouteProp } from '@react-navigation/native';
+import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import presentAlert from '../../components/Alert';
 import { useTheme } from '../../components/themes';
 import Button from '../../components/Button';
@@ -19,13 +20,12 @@ import { TWallet, CreateTransactionTarget } from '../../class/wallets/types';
 import PayjoinTransaction from '../../class/payjoin-transaction';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { SendDetailsStackParamList } from '../../navigation/SendDetailsStackParamList';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import { ContactList } from '../../class/contact-list';
 import { useStorage } from '../../hooks/context/useStorage';
-import { HDSegwitBech32Wallet } from '../../class';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
 import { useSettings } from '../../hooks/context/useSettings';
 import { majorTomToGroundControl } from '../../blue_modules/notifications';
-import { uint8ArrayToHex } from '../../blue_modules/uint8array-extras';
+import { errorMessage } from '../../helpers/errorMessage';
 
 enum ActionType {
   SET_LOADING = 'SET_LOADING',
@@ -70,9 +70,23 @@ const Confirm: React.FC = () => {
   const { wallets, fetchAndSaveWalletTransactions, counterpartyMetadata } = useStorage();
   const { isElectrumDisabled } = useSettings();
   const { isBiometricUseCapableAndEnabled } = useBiometrics();
-  const navigation = useExtendedNavigation<ConfirmNavigationProp>();
+  const navigation = useNavigation<ConfirmNavigationProp>();
   const route = useRoute<ConfirmRouteProp>(); // Get the route and its params
-  const { recipients, targets, walletID, fee, memo, tx, satoshiPerByte, psbt, payjoinUrl } = route.params; // Destructure params
+  const {
+    recipients,
+    targets,
+    walletID,
+    fee,
+    memo,
+    tx,
+    satoshiPerByte,
+    psbt,
+    payjoinUrl,
+    payjoinAddress,
+    payjoinDisableOutputSubstitution,
+  } = route.params; // Destructure params
+  // only the recipient the BIP21 `pj=` came with may be payjoined; gone (edited address, batch without it) → no payjoin
+  const paymentScript = useMemo(() => PayjoinTransaction.paymentScriptFor(recipients, payjoinAddress), [recipients, payjoinAddress]);
 
   const [state, dispatch] = useReducer(reducer, initialState);
   const { navigate, setOptions, goBack } = navigation;
@@ -86,74 +100,84 @@ const Confirm: React.FC = () => {
     }
   }, [wallet, goBack]);
 
-  const stylesHook = StyleSheet.create({
-    transactionDetailsTitle: {
-      color: colors.foregroundColor,
-    },
-    transactionDetailsSubtitle: {
-      color: colors.feeText,
-    },
-    transactionAmountFiat: {
-      color: colors.feeText,
-    },
-    txDetails: {
-      backgroundColor: colors.lightButton,
-    },
-    valueValue: {
-      color: colors.alternativeTextColor2,
-    },
-    valueUnit: {
-      color: colors.buttonTextColor,
-    },
-    root: {
-      backgroundColor: colors.elevated,
-    },
-    payjoinWrapper: {
-      backgroundColor: colors.buttonDisabledBackgroundColor,
-    },
-    addressSection: {
-      color: colors.alternativeTextColor2,
-    },
-  });
-
-  const HeaderRightButton = useMemo(
-    () => (
-      <TouchableOpacity
-        accessibilityRole="button"
-        testID="TransactionDetailsButton"
-        style={[styles.txDetails, stylesHook.txDetails]}
-        onPress={async () => {
-          if (await isBiometricUseCapableAndEnabled()) {
-            if (!(await unlockWithBiometrics())) {
-              return;
-            }
-          }
-          navigate('CreateTransaction', {
-            fee,
-            recipients,
-            memo,
-            tx,
-            satoshiPerByte,
-            feeSatoshi,
-          });
-        }}
-      >
-        <Text style={[styles.txText, stylesHook.valueUnit]}>{loc.send.create_details}</Text>
-      </TouchableOpacity>
-    ),
+  const stylesHook = useMemo(
+    () => ({
+      transactionDetailsTitle: {
+        color: colors.foregroundColor,
+      },
+      transactionDetailsSubtitle: {
+        color: colors.feeText,
+      },
+      transactionAmountFiat: {
+        color: colors.feeText,
+      },
+      txDetails: {
+        backgroundColor: colors.lightButton,
+      },
+      valueValue: {
+        color: colors.alternativeTextColor2,
+      },
+      valueUnit: {
+        color: colors.buttonTextColor,
+      },
+      root: {
+        backgroundColor: colors.elevated,
+      },
+      payjoinWrapper: {
+        backgroundColor: colors.buttonDisabledBackgroundColor,
+      },
+      addressSection: {
+        color: colors.alternativeTextColor2,
+      },
+    }),
     [
-      stylesHook.txDetails,
-      stylesHook.valueUnit,
-      isBiometricUseCapableAndEnabled,
-      navigate,
+      colors.foregroundColor,
+      colors.feeText,
+      colors.lightButton,
+      colors.alternativeTextColor2,
+      colors.buttonTextColor,
+      colors.elevated,
+      colors.buttonDisabledBackgroundColor,
+    ],
+  );
+
+  const biometricCapabilityRef = useRef(isBiometricUseCapableAndEnabled);
+
+  useEffect(() => {
+    biometricCapabilityRef.current = isBiometricUseCapableAndEnabled;
+  }, [isBiometricUseCapableAndEnabled]);
+
+  const handleOpenCreateTransaction = useCallback(async () => {
+    if (await biometricCapabilityRef.current()) {
+      if (!(await unlockWithBiometrics())) {
+        return;
+      }
+    }
+    navigate('CreateTransaction', {
       fee,
       recipients,
       memo,
       tx,
       satoshiPerByte,
       feeSatoshi,
-    ],
+    });
+  }, [navigate, fee, recipients, memo, tx, satoshiPerByte, feeSatoshi]);
+
+  const HeaderRightButton = useMemo(
+    () => (
+      <Pressable
+        accessibilityRole="button"
+        testID="TransactionDetailsButton"
+        style={({ pressed }) => [styles.txDetails, stylesHook.txDetails, pressed && styles.txDetailsPressed]}
+        onPress={handleOpenCreateTransaction}
+      >
+        <Text style={[styles.txText, stylesHook.valueUnit]}>{loc.send.create_details}</Text>
+      </Pressable>
+    ),
+    [stylesHook.txDetails, stylesHook.valueUnit, handleOpenCreateTransaction],
   );
+
+  const renderHeaderRight = useCallback(() => HeaderRightButton, [HeaderRightButton]);
 
   useEffect(() => {
     console.log('send/confirm - useEffect');
@@ -162,16 +186,9 @@ const Confirm: React.FC = () => {
 
   useEffect(() => {
     setOptions({
-      headerRight: () => HeaderRightButton,
+      headerRight: renderHeaderRight,
     });
-  }, [HeaderRightButton, colors, fee, feeSatoshi, memo, recipients, satoshiPerByte, setOptions, tx, wallet]);
-
-  const getPaymentScript = (): Uint8Array | undefined => {
-    if (!(recipients.length > 0) || !recipients[0].address) {
-      return undefined;
-    }
-    return bitcoin.address.toOutputScript(recipients[0].address, bitcoin.networks.bitcoin);
-  };
+  }, [renderHeaderRight, setOptions]);
 
   const handleSendTransaction = async () => {
     dispatch({ type: ActionType.SET_BUTTON_DISABLED, payload: true });
@@ -188,6 +205,9 @@ const Confirm: React.FC = () => {
       }
 
       const txidsToWatch = [];
+      let txid = bitcoin.Transaction.fromHex(tx).getId();
+      let feeBtc = Number(fee);
+      let payjoinNotUsed = false;
       if (!state.isPayjoinEnabled) {
         // Only broadcast the transaction after biometrics pass
         const result = await broadcastTransaction(tx);
@@ -198,25 +218,32 @@ const Confirm: React.FC = () => {
         }
       } else {
         const payJoinWallet = new PayjoinTransaction(psbt, (txHex: string) => broadcastTransaction(txHex), wallet as HDSegwitBech32Wallet);
-        const paymentScript = getPaymentScript();
         if (!paymentScript) {
           throw new Error('Invalid payment script');
         }
-        const payjoinClient = new PayjoinClient({
-          paymentScript: Buffer.from(uint8ArrayToHex(paymentScript), 'hex'),
-          wallet: payJoinWallet.getPayjoinPsbt(),
-          payjoinUrl: payjoinUrl as string,
+        const payjoinClient = payJoinWallet.createClient(paymentScript, payjoinUrl as string, {
+          ...payJoinWallet.payjoinParameters(satoshiPerByte),
+          ...(payjoinDisableOutputSubstitution ? { disableOutputSubstitution: true } : {}),
         });
-        await payjoinClient.run();
+        try {
+          await payjoinClient.run();
+        } catch (error) {
+          // the client already broadcast the plain (non-payjoin) tx: payment went through, just not as payjoin
+          if (!payJoinWallet.wasOriginalBroadcast()) throw error;
+          console.warn('payjoin failed, original transaction broadcast instead:', errorMessage(error));
+          payjoinNotUsed = true;
+        }
         const payjoinPsbt = payJoinWallet.getPayjoinPsbt();
         if (payjoinPsbt) {
-          const txToWatch = payjoinPsbt.extractTransaction();
-          txidsToWatch.push(txToWatch.getId());
+          // the payjoin tx is the one that went out; Success and the block explorer link must point at it
+          const sent = payJoinWallet.getSentTransaction();
+          txid = sent.txid;
+          feeBtc = Number(sent.fee) / 100000000;
+          txidsToWatch.push(txid);
         }
       }
 
-      const txid = bitcoin.Transaction.fromHex(tx).getId();
-      txidsToWatch.push(txid);
+      txidsToWatch.push(bitcoin.Transaction.fromHex(tx).getId());
       majorTomToGroundControl([], [], txidsToWatch);
       let amount = 0;
       for (const recipient of recipients) {
@@ -228,26 +255,30 @@ const Confirm: React.FC = () => {
       amount = Number(formatBalanceWithoutSuffix(amount, BitcoinUnit.BTC, false));
       triggerHapticFeedback(HapticFeedbackTypes.NotificationSuccess);
       navigate('Success', {
-        fee: Number(fee),
+        fee: feeBtc,
         amount,
         txid,
       });
+      if (payjoinNotUsed) {
+        presentAlert({ message: loc.send.payjoin_not_used });
+      }
 
       dispatch({ type: ActionType.SET_LOADING, payload: false });
 
       await new Promise(resolve => setTimeout(resolve, 3000)); // sleep to make sure network propagates
       fetchAndSaveWalletTransactions(walletID);
-    } catch (error: any) {
+    } catch (error) {
       triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
       dispatch({ type: ActionType.SET_LOADING, payload: false });
       dispatch({ type: ActionType.SET_BUTTON_DISABLED, payload: false });
-      presentAlert({ message: error.message });
+      presentAlert({ message: errorMessage(error) });
     }
   };
 
   const broadcastTransaction = async (transaction: string) => {
-    await BlueElectrum.ping();
-    await BlueElectrum.waitTillConnected();
+    if (!(await BlueElectrum.ensureConnected())) {
+      throw new Error(loc.errors.network);
+    }
 
     const result = await wallet.broadcastTx(transaction);
     if (!result) {
@@ -283,19 +314,25 @@ const Confirm: React.FC = () => {
       <>
         <View style={styles.valueWrap}>
           <Text testID="TransactionValue" style={[styles.valueValue, stylesHook.valueValue]}>
-            {item.value && satoshiToBTC(item.value)}
+            {item.value != null ? satoshiToBTC(item.value) : null}
           </Text>
           <Text style={[styles.valueUnit, stylesHook.valueValue]}>{' ' + loc.units[BitcoinUnit.BTC]}</Text>
         </View>
         <Text style={[styles.transactionAmountFiat, stylesHook.transactionAmountFiat]}>
-          {item.value && satoshiToLocalCurrency(item.value)}
+          {item.value != null ? satoshiToLocalCurrency(item.value) : null}
         </Text>
         <BlueCard>
           <Text style={[styles.transactionDetailsTitle, stylesHook.transactionDetailsTitle]}>{loc.send.create_to}</Text>
-          <Text testID="TransactionAddress" style={[styles.transactionDetailsSubtitle, stylesHook.transactionDetailsSubtitle]}>
-            <Text style={stylesHook.addressSection}>{item?.address?.slice(0, 6)}</Text>
-            <Text>{item?.address?.slice(6, -6)}</Text>
-            <Text style={stylesHook.addressSection}>{item?.address?.slice(-6)}</Text>
+          <Text selectable testID="TransactionAddress" style={[styles.transactionDetailsSubtitle, stylesHook.transactionDetailsSubtitle]}>
+            {item.address ? (
+              <>
+                <Text style={stylesHook.addressSection}>{item.address.slice(0, 6)}</Text>
+                <Text>{item.address.slice(6, -6)}</Text>
+                <Text style={stylesHook.addressSection}>{item.address.slice(-6)}</Text>
+              </>
+            ) : (
+              formatTransactionOutput(item)
+            )}
           </Text>
           {contact ? <Text style={[styles.transactionDetailsSubtitle, stylesHook.transactionDetailsSubtitle]}>[{contact}]</Text> : null}
         </BlueCard>
@@ -314,14 +351,14 @@ const Confirm: React.FC = () => {
     <SafeArea style={[styles.root, stylesHook.root]}>
       <View style={styles.cardTop}>
         <FlatList<CreateTransactionTarget>
-          scrollEnabled={recipients.length > 1}
+          style={styles.outputList}
           extraData={recipients}
           data={recipients}
           renderItem={renderItem}
           keyExtractor={(_item, index) => `${index}`}
           ItemSeparatorComponent={renderSeparator}
         />
-        {!!payjoinUrl && (
+        {!!payjoinUrl && !!paymentScript && (
           <View style={styles.cardContainer}>
             <BlueCard>
               <View style={[styles.payjoinWrapper, stylesHook.payjoinWrapper]}>
@@ -359,6 +396,7 @@ const Confirm: React.FC = () => {
 export default Confirm;
 
 const styles = StyleSheet.create({
+  outputList: { width: '100%' },
   transactionDetailsTitle: {
     fontWeight: '500',
     fontSize: 17,
@@ -434,6 +472,9 @@ const styles = StyleSheet.create({
     width: 80,
     borderRadius: 8,
     height: 38,
+  },
+  txDetailsPressed: {
+    opacity: 0.7,
   },
   txText: {
     fontSize: 15,

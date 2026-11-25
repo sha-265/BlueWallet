@@ -5,8 +5,10 @@ import navigationStyle, { CloseButtonPosition } from '../components/navigationSt
 import { useTheme } from '../components/themes';
 import loc from '../loc';
 import { withLazySuspense } from './LazyLoadingIndicator';
+import { navigationGuardRouter } from './navigationGuard';
+import { ScanLNDInvoiceStackParamList } from './LNDStackParamsList';
 
-const Stack = createNativeStackNavigator();
+const Stack = createNativeStackNavigator<ScanLNDInvoiceStackParamList>();
 
 const ScanLNDInvoice = lazy(() => import('../screen/lnd/ScanLNDInvoice'));
 const SelectWallet = lazy(() => import('../screen/wallets/SelectWallet'));
@@ -25,7 +27,7 @@ const ScanQRCodeComponent = withLazySuspense(ScanQRCode);
 const ScanLNDInvoiceRoot = () => {
   const theme = useTheme();
   return (
-    <Stack.Navigator screenOptions={{ headerShadowVisible: false }}>
+    <Stack.Navigator screenOptions={{ headerShadowVisible: false }} UNSTABLE_router={navigationGuardRouter}>
       <Stack.Screen
         name="ScanLNDInvoice"
         component={ScanLNDInvoiceComponent}
@@ -35,7 +37,7 @@ const ScanLNDInvoiceRoot = () => {
           statusBarStyle: 'light',
           closeButtonPosition: CloseButtonPosition.Right,
         })(theme)}
-        initialParams={{ uri: undefined, walletID: undefined, invoice: undefined }}
+        initialParams={{ uri: undefined }}
       />
       <Stack.Screen
         name="SelectWallet"

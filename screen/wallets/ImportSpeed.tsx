@@ -2,8 +2,10 @@ import { useNavigation } from '@react-navigation/native';
 import React, { useState } from 'react';
 import { ActivityIndicator, StyleSheet, TextInput, View } from 'react-native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { BlueFormLabel, BlueFormMultiInput } from '../../BlueComponents';
-import { HDSegwitBech32Wallet, WatchOnlyWallet } from '../../class';
+import BlueFormLabel from '../../components/BlueFormLabel';
+import BlueFormMultiInput from '../../components/BlueFormMultiInput';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
+import { WatchOnlyWallet } from '../../class/wallets/watch-only-wallet';
 import presentAlert from '../../components/Alert';
 import Button from '../../components/Button';
 import SafeArea from '../../components/SafeArea';
@@ -11,6 +13,7 @@ import { useTheme } from '../../components/themes';
 import { useStorage } from '../../hooks/context/useStorage';
 import { AddWalletStackParamList } from '../../navigation/AddWalletStack';
 import { BlueSpacing20 } from '../../components/BlueSpacing';
+import { errorMessage } from '../../helpers/errorMessage';
 
 type NavigationProp = NativeStackNavigationProp<AddWalletStackParamList, 'ImportSpeed'>;
 
@@ -76,8 +79,8 @@ const ImportSpeed = () => {
       await wallet.fetchBalance();
       navigation.getParent()?.goBack();
       addAndSaveWallet(wallet);
-    } catch (e: any) {
-      presentAlert({ message: e.message });
+    } catch (e) {
+      presentAlert({ message: errorMessage(e) });
     } finally {
       setLoading(false);
     }

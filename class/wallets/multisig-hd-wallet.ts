@@ -67,7 +67,6 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
   static readonly typeReadable = 'Multisig Vault';
   // @ts-ignore: override
   public readonly type = MultisigHDWallet.type;
-  // @ts-ignore: override
   public readonly typeReadable = MultisigHDWallet.typeReadable;
 
   static FORMAT_P2WSH = 'p2wsh';
@@ -88,6 +87,7 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
   private _isWrappedSegwit: boolean = false;
   private _isLegacy: boolean = false;
   private _nodes: Record<number, Record<number, BIP32Interface>> = {}; // nodeIndex -> cosignerIndex -> BIP32Interface
+  private _cosignerXpubCache: Record<string, string> = {}; // cosigner+path+passphrase -> xpub, since deriving xpub from seed is expensive
   public _derivationPath: string = '';
   public gap_limit: number = 20;
 
@@ -133,6 +133,27 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     return this._cosigners.length;
   }
 
+  /**
+   * Editable copy of the already-parsed cosigners.
+   * Round-tripping through getSecret()/setSecret() re-runs BIP39 for every seed.
+   */
+  cloneCosigners(): MultisigHDWallet {
+    const clone = new MultisigHDWallet();
+    const label = this.getLabel();
+    if (label) clone.setLabel(label);
+    clone.setM(this.getM());
+    clone._derivationPath = this._derivationPath;
+    clone._isNativeSegwit = this._isNativeSegwit;
+    clone._isWrappedSegwit = this._isWrappedSegwit;
+    clone._isLegacy = this._isLegacy;
+    clone._cosigners = this._cosigners.slice();
+    clone._cosignersFingerprints = this._cosignersFingerprints.slice();
+    clone._cosignersCustomPaths = this._cosignersCustomPaths.slice();
+    clone._cosignersPassphrases = this._cosignersPassphrases.slice();
+    clone._cosignerXpubCache = { ...this._cosignerXpubCache };
+    return clone;
+  }
+
   setDerivationPath(path: string) {
     this._derivationPath = path;
     switch (this._derivationPath) {
@@ -160,6 +181,14 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
   getCosigner(index: number) {
     if (index === 0) throw new Error('cosigners indexation starts from 1');
     return this._cosigners[index - 1];
+  }
+
+  /**
+   * Cosigner's xpub, taken from the cache when its seed was already derived
+   */
+  getCosignerXpub(index: number): string {
+    if (index === 0) throw new Error('cosigners indexation starts from 1');
+    return this._getXpubFromCosignerIndex(index - 1);
   }
 
   getFingerprint(index: number) {
@@ -198,6 +227,10 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     } catch (_) {
       return false;
     }
+  }
+
+  static isValidElectrumSeed(seed: string) {
+    return mn.validateMnemonic(seed, mn.PREFIXES.segwit) || mn.validateMnemonic(seed, mn.PREFIXES.standard);
   }
 
   /**
@@ -276,6 +309,9 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
       throw new Error('Invalid cosigner index or cosigners not initialized');
     }
     let cosigner: string = this._cosigners[index];
+    const cacheKey =
+      cosigner + '|' + (this._cosignersCustomPaths[index] || this._derivationPath) + '|' + (this._cosignersPassphrases[index] ?? '');
+    if (this._cosignerXpubCache[cacheKey]) return this._cosignerXpubCache[cacheKey]; // cache hit
     if (MultisigHDWallet.isXprvString(cosigner)) cosigner = MultisigHDWallet.convertXprvToXpub(cosigner);
     let xpub = cosigner;
     if (!MultisigHDWallet.isXpubString(cosigner)) {
@@ -285,7 +321,7 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
         this._cosignersPassphrases[index],
       );
     }
-    return this._zpubToXpub(xpub);
+    return (this._cosignerXpubCache[cacheKey] = this._zpubToXpub(xpub));
   }
 
   _getExternalAddressByIndex(index: number) {
@@ -394,18 +430,6 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     return xpub;
   }
 
-  convertXprvToMultisignatureXprv(xpub: string): string {
-    let data = b58.decode(xpub);
-    data = data.slice(4);
-    if (this.isNativeSegwit()) {
-      return b58.encode(concatUint8Arrays([hexToUint8Array('02aa7a99'), data]));
-    } else if (this.isWrappedSegwit()) {
-      return b58.encode(concatUint8Arrays([hexToUint8Array('0295b005'), data]));
-    }
-
-    return xpub;
-  }
-
   static isXpubString(xpub: string): boolean {
     return ['xpub', 'ypub', 'zpub', 'Ypub', 'Zpub'].includes(xpub.substring(0, 4));
   }
@@ -504,7 +528,17 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
               this._cosignersPassphrases[index],
             ),
           );
-          const fingerprint = MultisigHDWallet.mnemonicToFingerprint(this._cosigners[index], this._cosignersPassphrases[index]);
+          let fingerprint: string;
+          let mnemonic = this._cosigners[index];
+          const passphrase = this._cosignersPassphrases[index];
+          if (mnemonic.startsWith(ELECTRUM_SEED_PREFIX)) {
+            mnemonic = mnemonic.replace(ELECTRUM_SEED_PREFIX, '');
+            const seed = MultisigHDWallet.convertElectrumMnemonicToSeed(mnemonic, passphrase);
+            fingerprint = MultisigHDWallet.seedToFingerprint(seed);
+          } else {
+            fingerprint = MultisigHDWallet.mnemonicToFingerprint(mnemonic, this._cosignersPassphrases[index]);
+          }
+
           ret += fingerprint + ': ' + xpub + '\n';
         } else {
           ret += 'seed: ' + this._cosigners[index];
@@ -542,18 +576,19 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
       this.setM(parseInt(mofn[0].trim(), 10));
       const n = parseInt(mofn[1].trim(), 10);
       for (let c = 1; c <= n; c++) {
-        const cosignerData = json['x' + c + '/'];
+        const cosignerData = json['x' + c + '/'] || json['x' + c];
         if (cosignerData) {
+          const derivationPath = cosignerData.derivation ? cosignerData.derivation.replace(/h/g, "'") : undefined;
           const fingerprint =
             (cosignerData.ckcc_xfp
               ? MultisigHDWallet.ckccXfp2fingerprint(cosignerData.ckcc_xfp)
               : cosignerData.root_fingerprint?.toUpperCase()) || '00000000';
           if (cosignerData.seed) {
-            this.addCosigner(ELECTRUM_SEED_PREFIX + cosignerData.seed, fingerprint, cosignerData.derivation, cosignerData.passphrase);
+            this.addCosigner(ELECTRUM_SEED_PREFIX + cosignerData.seed, fingerprint, derivationPath, cosignerData.passphrase);
           } else if (cosignerData.xprv && MultisigHDWallet.isXprvValid(cosignerData.xprv)) {
-            this.addCosigner(cosignerData.xprv, fingerprint, cosignerData.derivation);
+            this.addCosigner(cosignerData.xprv, fingerprint, derivationPath);
           } else {
-            this.addCosigner(cosignerData.xpub, fingerprint, cosignerData.derivation);
+            this.addCosigner(cosignerData.xpub, fingerprint, derivationPath);
           }
         }
 
@@ -566,8 +601,8 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     // coldcard & cobo txt format:
     let customPathForCurrentCosigner: string | undefined;
     for (const line of secret.split('\n')) {
-      const [key, value] = line.split(':');
-
+      const [key, ...valueParts] = line.split(':');
+      const value = valueParts.join(':');
       switch (key) {
         case 'Name':
           this.setLabel(value.trim());
@@ -598,12 +633,20 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
 
         default:
           if (key && value && MultisigHDWallet.isXpubString(value.trim())) {
-            this.addCosigner(value.trim(), key, customPathForCurrentCosigner);
+            const path = customPathForCurrentCosigner ?? this._derivationPath;
+            this.addCosigner(value.trim(), key, path);
           } else if (key.replace('#', '').trim() === 'derivation') {
             customPathForCurrentCosigner = value.trim();
           } else if (key === 'seed') {
-            const [seed, passphrase] = value.split(' - ');
-            this.addCosigner(seed.trim(), undefined, customPathForCurrentCosigner, passphrase);
+            const [rawSeed, passphrase] = value.split(' - ');
+            const seed = rawSeed.trim();
+            let fingerprint: string | undefined;
+            if (seed.startsWith(ELECTRUM_SEED_PREFIX)) {
+              const electrumSeed = MultisigHDWallet.convertElectrumMnemonicToSeed(seed, passphrase);
+              fingerprint = MultisigHDWallet.seedToFingerprint(electrumSeed);
+            }
+            const path = customPathForCurrentCosigner ?? this._derivationPath;
+            this.addCosigner(seed.trim(), fingerprint, path, passphrase);
           }
           break;
       }
@@ -735,22 +778,23 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     throw new Error('Not applicable in multisig');
   }
 
-  _addPsbtInput(psbt: Psbt, input: CoinSelectReturnInput, sequence: number, masterFingerprintBuffer?: Uint8Array) {
-    const bip32Derivation = []; // array per each pubkey thats gona be used
+  /**
+   * Builds bip32Derivation entries (and the corresponding pubkeys) for every cosigner for a given address
+   * of this wallet. Used both for inputs and for change outputs.
+   */
+  _getBip32DerivationsByAddress(address: string) {
+    const bip32Derivation: TBip32Derivation = []; // array per each pubkey thats gona be used
     const pubkeys = [];
     for (const [cosignerIndex] of this._cosigners.entries()) {
-      if (!input.address) {
-        throw new Error('Could not find address in input');
-      }
       const path = this._getDerivationPathByAddressWithCustomPath(
-        input.address,
+        address,
         this._cosignersCustomPaths[cosignerIndex] || this._derivationPath,
       );
       // ^^ path resembles _custom path_, if provided by user during setup, otherwise default path for wallet type gona be used
       const masterFingerprint = hexToUint8Array(this._cosignersFingerprints[cosignerIndex]);
 
       if (!path) {
-        throw new Error('Could not find derivation path for address ' + input.address);
+        throw new Error('Could not find derivation path for address ' + address);
       }
 
       const xpub = this._getXpubFromCosignerIndex(cosignerIndex);
@@ -768,6 +812,15 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
         pubkey,
       });
     }
+
+    return { bip32Derivation, pubkeys };
+  }
+
+  _addPsbtInput(psbt: Psbt, input: CoinSelectReturnInput, sequence: number, masterFingerprintBuffer?: Uint8Array) {
+    if (!input.address) {
+      throw new Error('Could not find address in input');
+    }
+    const { bip32Derivation, pubkeys } = this._getBip32DerivationsByAddress(input.address);
 
     if (!input.txhex) {
       throw new Error('Electrum server didnt provide txhex to properly create PSBT transaction');
@@ -848,35 +901,7 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
   }
 
   _getOutputDataForChange(address: string): TOutputData {
-    const bip32Derivation: TBip32Derivation = []; // array per each pubkey thats gona be used
-    const pubkeys = [];
-    for (const [cosignerIndex] of this._cosigners.entries()) {
-      const path = this._getDerivationPathByAddressWithCustomPath(
-        address,
-        this._cosignersCustomPaths[cosignerIndex] || this._derivationPath,
-      );
-      // ^^ path resembles _custom path_, if provided by user during setup, otherwise default path for wallet type gona be used
-      const masterFingerprint = hexToUint8Array(this._cosignersFingerprints[cosignerIndex]);
-
-      if (!path) {
-        throw new Error('Could not find derivation path for address ' + address);
-      }
-
-      const xpub = this._getXpubFromCosignerIndex(cosignerIndex);
-      const hdNode0 = bip32.fromBase58(xpub);
-      const splt = path.split('/');
-      const internal = +splt[splt.length - 2];
-      const index = +splt[splt.length - 1];
-      const _node0 = hdNode0.derive(internal);
-      const pubkey = _node0.derive(index).publicKey;
-      pubkeys.push(pubkey);
-
-      bip32Derivation.push({
-        masterFingerprint,
-        path,
-        pubkey,
-      });
-    }
+    const { bip32Derivation, pubkeys } = this._getBip32DerivationsByAddress(address);
 
     if (this.isLegacy()) {
       const p2sh = bitcoin.payments.p2ms({ m: this._m, pubkeys: MultisigHDWallet.sortBuffers(pubkeys) });
@@ -934,6 +959,11 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     return howManyPrivKeysWeGot;
   }
 
+  getChangeScriptLength(): number {
+    // p2wsh is OP_0 + 32 bytes hash
+    return this.isNativeSegwit() ? 34 : 25;
+  }
+
   coinselect(
     utxos: CreateTransactionUtxo[],
     targets: CreateTransactionTarget[],
@@ -956,9 +986,13 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
           length: 35 + Math.ceil((8 + this.getM() * 74 + this.getN() * 34) / 4),
         };
       } else {
-        u.script = {
-          length: 2 + this.getM() * 74 + this.getN() * 34,
-        };
+        // scriptSig is: OP_0 + M signatures (push opcode + up to 73 bytes of signature with sighash byte) + pushed redeem script
+        const redeemScriptLength = 3 + this.getN() * 34;
+        const pushLength = redeemScriptLength > 255 ? 3 : redeemScriptLength > 75 ? 2 : 1;
+        let length = 1 + this.getM() * 74 + pushLength + redeemScriptLength;
+        // coinselect lib counts 1 byte for scriptSig length, but it takes 3 bytes when scriptSig is over 252 bytes
+        if (length > 252) length += 2;
+        u.script = { length };
       }
     }
 
@@ -1017,24 +1051,26 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     });
 
     if (!skipSigning) {
-      for (let cc = 0; cc < c; cc++) {
-        let signaturesMade = 0;
-        for (const [cosignerIndex, cosigner] of this._cosigners.entries()) {
-          if (MultisigHDWallet.isXpubString(cosigner)) continue;
-          // ok this is a mnemonic, lets try to sign
-          if (signaturesMade >= this.getM()) {
-            // dont sign more than we need, otherwise there will be "Too many signatures" error
-            continue;
-          }
-          const passphrase = this._cosignersPassphrases[cosignerIndex];
-          let seed = bip39.mnemonicToSeedSync(cosigner, passphrase);
-          if (cosigner.startsWith(ELECTRUM_SEED_PREFIX)) {
-            seed = MultisigHDWallet.convertElectrumMnemonicToSeed(cosigner, passphrase);
-          }
+      // deriving a seed is an expensive pbkdf2 operation, so we prepare each signing cosigner's hd root
+      // only once and reuse it for every input
+      const hdRoots: BIP32Interface[] = [];
+      for (const [cosignerIndex, cosigner] of this._cosigners.entries()) {
+        if (MultisigHDWallet.isXpubString(cosigner)) continue;
+        // ok this is a mnemonic, lets try to sign
+        if (hdRoots.length >= this.getM()) {
+          // dont sign more than we need, otherwise there will be "Too many signatures" error
+          continue;
+        }
+        const passphrase = this._cosignersPassphrases[cosignerIndex];
+        const seed = cosigner.startsWith(ELECTRUM_SEED_PREFIX)
+          ? MultisigHDWallet.convertElectrumMnemonicToSeed(cosigner, passphrase)
+          : bip39.mnemonicToSeedSync(cosigner, passphrase);
+        hdRoots.push(bip32.fromSeed(seed));
+      }
 
-          const hdRoot = bip32.fromSeed(seed);
+      for (let cc = 0; cc < c; cc++) {
+        for (const hdRoot of hdRoots) {
           psbt.signInputHD(cc, hdRoot);
-          signaturesMade++;
         }
       }
     }
@@ -1071,6 +1107,7 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     // deleting structures that cant be serialized
     // @ts-ignore I dont want to make it optional
     delete this._nodes;
+    this._cosignerXpubCache = {}; // no need to persist the cache
   }
 
   static isPathValid(path: string): boolean {
@@ -1090,21 +1127,24 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     return false;
   }
 
+  allowLnurlAuth() {
+    return false;
+  }
+
   async fetchUtxo() {
     await super.fetchUtxo();
     // now we need to fetch txhash for each input as required by PSBT
+    const utxos = this.getUtxo(true);
     const txhexes = await BlueElectrum.multiGetTransactionByTxid(
-      this.getUtxo(true).map(x => x.txid),
+      utxos.map(x => x.txid),
       false,
     );
 
-    const newUtxos = [];
-    for (const u of this.getUtxo(true)) {
+    for (const u of utxos) {
       if (txhexes[u.txid]) u.txhex = txhexes[u.txid];
-      newUtxos.push(u);
     }
 
-    this._utxo = newUtxos;
+    this._utxo = utxos;
   }
 
   getID() {
@@ -1114,29 +1154,31 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
 
   calculateFeeFromPsbt(psbt: Psbt) {
     let goesIn = 0;
-    const cacheUtxoAmounts: { [key: string]: number } = {};
-    for (const inp of psbt.data.inputs) {
-      if (inp.witnessUtxo && inp.witnessUtxo.value) {
-        // segwit input
-        goesIn += Number(inp.witnessUtxo.value);
-      } else if (inp.nonWitnessUtxo) {
-        // non-segwit input
-        // lets parse this transaction and cache how much each input was worth
-        const inputTx = bitcoin.Transaction.fromBuffer(inp.nonWitnessUtxo);
-        let index = 0;
-        for (const out of inputTx.outs) {
-          cacheUtxoAmounts[inputTx.getId() + ':' + index] = Number(out.value);
-          index++;
+    // Prefer nonWitnessUtxo per input (same as bitcoinjs-lib). A PSBT may carry both;
+    // trusting witnessUtxo first let a false value hide the real fee on legacy inputs,
+    // and made mixed segwit+legacy PSBTs drop legacy amounts entirely.
+    // Do not throw on a mismatched witnessUtxo: getFee() is called during render without
+    // a try/catch, so we just use the real amount for the fee line.
+    const txInputs = psbt.txInputs; // getter clones all inputs on every access
+    for (let i = 0; i < psbt.data.inputs.length; i++) {
+      const inp = psbt.data.inputs[i];
+      const txInput = txInputs[i];
+
+      if (inp.nonWitnessUtxo) {
+        try {
+          const inputTx = bitcoin.Transaction.fromBuffer(inp.nonWitnessUtxo);
+          const prevout = inputTx.outs[txInput.index];
+          if (prevout && inputTx.getId() === uint8ArrayToHex(new Uint8Array(txInput.hash).reverse())) {
+            goesIn += Number(prevout.value);
+            continue;
+          }
+        } catch {
+          // unparsable parent tx, fall back to witnessUtxo
         }
       }
-    }
 
-    if (goesIn === 0) {
-      // means we failed to get amounts that go in previously, so lets use utxo amounts cache we've build
-      // from non-segwit inputs
-      for (const inp of psbt.txInputs) {
-        const cacheKey = uint8ArrayToHex(new Uint8Array(inp.hash).reverse()) + ':' + inp.index;
-        if (cacheUtxoAmounts[cacheKey]) goesIn += cacheUtxoAmounts[cacheKey];
+      if (inp.witnessUtxo && inp.witnessUtxo.value) {
+        goesIn += Number(inp.witnessUtxo.value);
       }
     }
 
@@ -1148,15 +1190,115 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     return goesIn - goesOut;
   }
 
+  static _isPsbtInputFinalized(input: Psbt['data']['inputs'][number]) {
+    return !!(input.finalScriptSig || input.finalScriptWitness);
+  }
+
+  /**
+   * Signatures the input has towards the quorum, the same way bitcoinjs counts them when finalizing:
+   * only signatures by keys from the input's multisig script
+   */
+  _countInputSignatures(psbt: Psbt, inputIndex: number) {
+    const input = psbt.data.inputs[inputIndex];
+    // finalized input has no partialSig anymore, but it means we have enough
+    // He who knows that enough is enough will always have enough. Lao Tzu
+    if (MultisigHDWallet._isPsbtInputFinalized(input)) return this.getM();
+
+    let sigs = 0;
+    for (const { pubkey } of input.partialSig || []) {
+      try {
+        if (psbt.inputHasPubkey(inputIndex, pubkey)) sigs++;
+      } catch (_) {
+        sigs++; // cannot verify against the script (missing or mismatched), assume the signature counts
+      }
+    }
+    return sigs;
+  }
+
+  /**
+   * Finalizes inputs that are not finalized yet, finalizing an input twice throws
+   */
+  static finalizeUnfinalizedInputs(psbt: Psbt) {
+    for (let cc = 0; cc < psbt.inputCount; cc++) {
+      if (!MultisigHDWallet._isPsbtInputFinalized(psbt.data.inputs[cc])) psbt.finalizeInput(cc);
+    }
+  }
+
+  /**
+   * Drops partial signatures beyond the quorum, in place. bitcoinjs refuses to finalize an input with more
+   * signatures than M ("Too many signatures"), but any M valid signatures are enough, so the surplus is just removed.
+   * Signatures by keys that are not in the input's script are dropped first, then ones that do not verify.
+   */
+  _dropSurplusSignatures(psbt: Psbt) {
+    const m = this.getM();
+    for (let cc = 0; cc < psbt.inputCount; cc++) {
+      const input = psbt.data.inputs[cc];
+      if (MultisigHDWallet._isPsbtInputFinalized(input) || !input.partialSig || input.partialSig.length <= m) continue;
+
+      const inScript = input.partialSig.filter(({ pubkey }) => {
+        try {
+          return psbt.inputHasPubkey(cc, pubkey);
+        } catch (_) {
+          return true; // cannot verify against the script, keep it and let finalize decide
+        }
+      });
+      const verifies = ({ pubkey }: { pubkey: Uint8Array }) => {
+        try {
+          return psbt.validateSignaturesOfInput(cc, (pk, msghash, sig) => ecc.verify(msghash, pk, sig), pubkey);
+        } catch (_) {
+          return false; // e.g. no UTXO to compute the sighash; such a signature goes after the verified ones
+        }
+      };
+      const verified = inScript.filter(verifies);
+      input.partialSig = [...verified, ...inScript.filter(sig => !verified.includes(sig))].slice(0, m);
+    }
+  }
+
+  /**
+   * Returns a finalized copy and leaves the passed PSBT untouched. Surplus signatures are dropped first, so an
+   * over-signed PSBT finalizes too. Throws when an input cannot be finalized (missing script, missing UTXO, too few
+   * signatures). Finalizing in place is not safe: bitcoinjs finalizes input by input, so a throw on a later input
+   * leaves the earlier ones finalized with their `partialSig` already deleted
+   */
+  finalizedCopy(psbt: Psbt): Psbt {
+    const copy = psbt.clone();
+    this._dropSurplusSignatures(copy);
+    MultisigHDWallet.finalizeUnfinalizedInputs(copy);
+    return copy;
+  }
+
+  /**
+   * What importing a PSBT to co-sign does with it. Never modifies the passed PSBT.
+   * - Quorum already reached: a finalized copy, without adding a signature (another one would only be surplus).
+   * - Below quorum and this vault holds keys: a copy with our signatures, finalized if that reaches the quorum.
+   * - Below quorum and watch-only: the PSBT as it is, to review or export.
+   * Finalize errors throw, so the caller alerts instead of presenting a PSBT that can never be finalized.
+   */
+  prepareImportedPsbt(psbt: Psbt): Psbt {
+    if (this.calculateHowManySignaturesWeHaveFromPsbt(psbt) >= this.getM()) return this.finalizedCopy(psbt);
+    if (!this.willCosignImportedPsbt(psbt)) return psbt;
+    const copy = psbt.clone();
+    this.cosignPsbt(copy);
+    return copy;
+  }
+
+  /**
+   * Whether prepareImportedPsbt() adds our signatures. Signing derives seeds, which is slow.
+   */
+  willCosignImportedPsbt(psbt: Psbt): boolean {
+    return this.calculateHowManySignaturesWeHaveFromPsbt(psbt) < this.getM() && this.howManySignaturesCanWeMake() > 0;
+  }
+
+  /**
+   * Number of signatures that every input has, i.e. the least signed input decides
+   */
   calculateHowManySignaturesWeHaveFromPsbt(psbt: Psbt) {
-    let sigsHave = 0;
-    for (const inp of psbt.data.inputs) {
-      sigsHave = Math.max(sigsHave, inp.partialSig?.length || 0);
-      if (inp.finalScriptSig || inp.finalScriptWitness) sigsHave = this.getM(); // hacky, but it means we have enough
-      // He who knows that enough is enough will always have enough. Lao Tzu
+    let sigsHave = Infinity;
+    for (let cc = 0; cc < psbt.inputCount; cc++) {
+      sigsHave = Math.min(sigsHave, this._countInputSignatures(psbt, cc));
     }
 
-    return sigsHave;
+    return sigsHave === Infinity ? 0 : sigsHave;
   }
 
   /**
@@ -1164,21 +1306,33 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
    * and returns Transaction (ready to extract hex)
    */
   cosignPsbt(psbt: Psbt): { tx: Transaction | false } {
-    for (let cc = 0; cc < psbt.inputCount; cc++) {
-      for (const [cosignerIndex, cosigner] of this._cosigners.entries()) {
-        if (MultisigHDWallet.isXpubString(cosigner)) continue;
+    // deriving a seed is an expensive pbkdf2 operation, so we prepare each signing cosigner's hd root
+    // only once and reuse it for every input
+    const hdRoots: { cosignerIndex: number; hdRoot: BIP32Interface }[] = [];
+    for (const [cosignerIndex, cosigner] of this._cosigners.entries()) {
+      if (MultisigHDWallet.isXpubString(cosigner)) continue;
 
-        let hdRoot;
-        if (MultisigHDWallet.isXprvString(cosigner)) {
-          const xprv = MultisigHDWallet.convertMultisigXprvToRegularXprv(cosigner);
-          hdRoot = bip32.fromBase58(xprv);
-        } else {
-          const passphrase = this._cosignersPassphrases[cosignerIndex];
-          const seed = cosigner.startsWith(ELECTRUM_SEED_PREFIX)
-            ? MultisigHDWallet.convertElectrumMnemonicToSeed(cosigner, passphrase)
-            : bip39.mnemonicToSeedSync(cosigner, passphrase);
-          hdRoot = bip32.fromSeed(seed);
-        }
+      let hdRoot;
+      if (MultisigHDWallet.isXprvString(cosigner)) {
+        const xprv = MultisigHDWallet.convertMultisigXprvToRegularXprv(cosigner);
+        hdRoot = bip32.fromBase58(xprv);
+      } else {
+        const passphrase = this._cosignersPassphrases[cosignerIndex];
+        const seed = cosigner.startsWith(ELECTRUM_SEED_PREFIX)
+          ? MultisigHDWallet.convertElectrumMnemonicToSeed(cosigner, passphrase)
+          : bip39.mnemonicToSeedSync(cosigner, passphrase);
+        hdRoot = bip32.fromSeed(seed);
+      }
+      hdRoots.push({ cosignerIndex, hdRoot });
+    }
+
+    for (let cc = 0; cc < psbt.inputCount; cc++) {
+      const input = psbt.data.inputs[cc];
+      if (MultisigHDWallet._isPsbtInputFinalized(input)) continue;
+
+      for (const { cosignerIndex, hdRoot } of hdRoots) {
+        // dont sign more than we need, otherwise there will be "Too many signatures" error
+        if (this._countInputSignatures(psbt, cc) >= this.getM()) break;
 
         try {
           psbt.signInputHD(cc, hdRoot);
@@ -1217,8 +1371,10 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     }
 
     if (this.calculateHowManySignaturesWeHaveFromPsbt(psbt) >= this.getM()) {
-      const tx = psbt.finalizeAllInputs().extractTransaction();
-      return { tx };
+      // an input that arrived with more signatures than M would make finalize throw; any M of them are enough
+      this._dropSurplusSignatures(psbt);
+      MultisigHDWallet.finalizeUnfinalizedInputs(psbt);
+      return { tx: psbt.extractTransaction() };
     }
 
     return { tx: false };
@@ -1231,8 +1387,17 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     const index = externalIndex - 1;
     const fingerprint = this._cosignersFingerprints[index];
     if (!MultisigHDWallet.isXpubValid(this._cosigners[index])) throw new Error('This cosigner doesnt contain valid xpub');
-    if (!bip39.validateMnemonic(mnemonic)) throw new Error('Not a valid mnemonic phrase');
-    if (fingerprint !== MultisigHDWallet.mnemonicToFingerprint(mnemonic, passphrase)) {
+    if (!bip39.validateMnemonic(mnemonic) && !MultisigHDWallet.isValidElectrumSeed(mnemonic))
+      throw new Error('Not a valid mnemonic phrase');
+    let calculatedFingerprint: string | undefined;
+    if (MultisigHDWallet.isValidElectrumSeed(mnemonic)) {
+      mnemonic = ELECTRUM_SEED_PREFIX + mnemonic;
+      const electrumSeed = MultisigHDWallet.convertElectrumMnemonicToSeed(mnemonic, passphrase);
+      calculatedFingerprint = MultisigHDWallet.seedToFingerprint(electrumSeed);
+    } else {
+      calculatedFingerprint = MultisigHDWallet.mnemonicToFingerprint(mnemonic, passphrase);
+    }
+    if (fingerprint !== calculatedFingerprint) {
       throw new Error('Fingerprint of new seed doesnt match');
     }
     this._cosigners[index] = mnemonic.trim();
@@ -1245,7 +1410,8 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
   replaceCosignerSeedWithXpub(externalIndex: number) {
     const index = externalIndex - 1;
     const mnemonics = this._cosigners[index];
-    if (!bip39.validateMnemonic(mnemonics)) throw new Error('This cosigner doesnt contain valid xpub mnemonic phrase');
+    if (!bip39.validateMnemonic(mnemonics) && !MultisigHDWallet.isValidElectrumSeed(mnemonics.replace(ELECTRUM_SEED_PREFIX, '')))
+      throw new Error('This cosigner doesnt contain valid xpub mnemonic phrase');
     const passphrase = this._cosignersPassphrases[index];
     const path = this._cosignersCustomPaths[index] || this._derivationPath;
     const xpub = this.convertXpubToMultisignatureXpub(MultisigHDWallet.seedToXpub(mnemonics, path, passphrase));
@@ -1272,13 +1438,6 @@ export class MultisigHDWallet extends AbstractHDElectrumWallet {
     this._cosignersPassphrases = this._cosignersPassphrases.filter((el, index) => {
       return index !== foundIndex;
     });
-
-    /* const newCosigners = [];
-    for (let c = 0; c < this._cosignersFingerprints.length; c++) {
-      if (c !== index)  newCosigners.push(this._cosignersFingerprints[c]);
-    } */
-
-    // this._cosignersFingerprints = newCosigners;
   }
 
   getFormat() {

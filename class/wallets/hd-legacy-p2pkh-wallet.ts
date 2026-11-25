@@ -19,8 +19,7 @@ export class HDLegacyP2PKHWallet extends AbstractHDElectrumWallet {
   static readonly typeReadable = 'HD Legacy (BIP44 P2PKH)';
   // @ts-ignore: override
   public readonly type = HDLegacyP2PKHWallet.type;
-  // @ts-ignore: override
-  public readonly typeReadable = HDLegacyP2PKHWallet.typeReadable;
+  public readonly typeReadable: string = HDLegacyP2PKHWallet.typeReadable;
   static readonly derivationPath = "m/44'/0'/0'";
 
   allowSend() {
@@ -71,12 +70,13 @@ export class HDLegacyP2PKHWallet extends AbstractHDElectrumWallet {
   async fetchUtxo(): Promise<void> {
     await super.fetchUtxo();
     // now we need to fetch txhash for each input as required by PSBT
+    const utxos = this.getUtxo();
     const txhexes = await BlueElectrum.multiGetTransactionByTxid(
-      this.getUtxo().map(x => x.txid),
+      utxos.map(x => x.txid),
       false,
     );
 
-    for (const u of this.getUtxo()) {
+    for (const u of utxos) {
       if (txhexes[u.txid]) u.txhex = txhexes[u.txid];
     }
   }

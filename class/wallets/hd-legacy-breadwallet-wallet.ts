@@ -20,7 +20,6 @@ export class HDLegacyBreadwalletWallet extends HDLegacyP2PKHWallet {
   static readonly typeReadable = 'HD Legacy Breadwallet (P2PKH)';
   // @ts-ignore: override
   public readonly type = HDLegacyBreadwalletWallet.type;
-  // @ts-ignore: override
   public readonly typeReadable = HDLegacyBreadwalletWallet.typeReadable;
   static readonly derivationPath = "m/0'";
 
@@ -159,11 +158,11 @@ export class HDLegacyBreadwalletWallet extends HDLegacyP2PKHWallet {
   }
 
   _addPsbtInput(psbt: Psbt, input: CoinSelectReturnInput, sequence: number, masterFingerprintBuffer: Uint8Array) {
-    // hack to use
     // AbstractHDElectrumWallet._addPsbtInput for bech32 address
     // HDLegacyP2PKHWallet._addPsbtInput for legacy address
-    const ProxyClass = input?.address?.startsWith('bc1') ? AbstractHDElectrumWallet : HDLegacyP2PKHWallet;
-    const proxy = new ProxyClass();
-    return proxy._addPsbtInput.apply(this, [psbt, input, sequence, masterFingerprintBuffer]);
+    if (input?.address?.startsWith('bc1')) {
+      return AbstractHDElectrumWallet.prototype._addPsbtInput.call(this, psbt, input, sequence, masterFingerprintBuffer);
+    }
+    return super._addPsbtInput(psbt, input, sequence, masterFingerprintBuffer);
   }
 }

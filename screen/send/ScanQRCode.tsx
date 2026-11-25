@@ -1,4 +1,4 @@
-import { RouteProp, StackActions, useIsFocused, useRoute } from '@react-navigation/native';
+import { useNavigation, RouteProp, StackActions, useIsFocused, useRoute } from '@react-navigation/native';
 import * as bitcoin from 'bitcoinjs-lib';
 import { sha256 } from '@noble/hashes/sha256';
 import React, { useEffect, useRef, useState } from 'react';
@@ -6,19 +6,20 @@ import { Platform, StyleSheet, TextInput, TouchableOpacity, View } from 'react-n
 import Base43 from '../../blue_modules/base43';
 import * as fs from '../../blue_modules/fs';
 import { BlueURDecoder, decodeUR, extractSingleWorkload } from '../../blue_modules/ur';
-import { BlueText } from '../../BlueComponents';
+import BlueText from '../../components/BlueText';
 import { openPrivacyDesktopSettings } from '../../class/camera';
 import Button from '../../components/Button';
 import { useTheme } from '../../components/themes';
 import { isCameraAuthorizationStatusGranted } from '../../helpers/scan-qr';
 import loc from '../../loc';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import CameraScreen from '../../components/CameraScreen';
+import type { OnReadCodeData } from 'react-native-camera-kit-no-google/dist/CameraProps';
 import SafeArea from '../../components/SafeArea';
 import { SendDetailsStackParamList } from '../../navigation/SendDetailsStackParamList.ts';
 import { BlueSpacing40 } from '../../components/BlueSpacing';
 import { BlueLoading } from '../../components/BlueLoading.tsx';
 import { hexToUint8Array, uint8ArrayToBase64, uint8ArrayToHex, uint8ArrayToString } from '../../blue_modules/uint8array-extras/index.js';
+import { errorMessage } from '../../helpers/errorMessage';
 
 let decoder: BlueURDecoder | undefined;
 
@@ -58,10 +59,10 @@ const styles = StyleSheet.create({
 
 const ScanQRCode = () => {
   const [isLoading, setIsLoading] = useState(false);
-  const navigation = useExtendedNavigation();
+  const navigation = useNavigation();
   const route = useRoute<RouteProps>();
   const navigationState = navigation.getState();
-  const previousRoute = navigationState.routes[navigationState.routes.length - 2];
+  const previousRoute = navigationState?.routes?.at(-2);
   const defaultLaunchedBy = previousRoute ? previousRoute.name : undefined;
 
   const { launchedBy = defaultLaunchedBy, showFileImportButton, onBarScanned } = route.params || {};
@@ -114,8 +115,9 @@ const ScanQRCode = () => {
         setUrTotal(100);
         setUrHave(Math.floor(decoder.estimatedPercentComplete() * 100));
       }
-    } catch (error: any) {
-      console.log('Invalid animated qr code fragment: ' + error.message + ' (continuing scanning)');
+    } catch (error) {
+      console.log('Invalid animated qr code fragment: ' + errorMessage(error) + ' (continuing scanning)');
+      decoder = undefined;
     }
   };
 
@@ -149,8 +151,8 @@ const ScanQRCode = () => {
       } else {
         setAnimatedQRCodeData(animatedQRCodeData);
       }
-    } catch (error: any) {
-      console.log('Invalid animated qr code fragment: ' + error.message + ' (continuing scanning)');
+    } catch (error) {
+      console.log('Invalid animated qr code fragment: ' + errorMessage(error) + ' (continuing scanning)');
     }
   };
 
@@ -171,6 +173,14 @@ const ScanQRCode = () => {
     }
 
     if (ret.data.toUpperCase().startsWith('UR:CRYPTO-OUTPUT')) {
+      return _onReadUniformResourceV2(ret.data);
+    }
+
+    if (ret.data.toUpperCase().startsWith('UR:CRYPTO-HDKEY')) {
+      return _onReadUniformResourceV2(ret.data);
+    }
+
+    if (ret.data.toUpperCase().startsWith('UR:CRYPTO-MULTI-ACCOUNTS')) {
       return _onReadUniformResourceV2(ret.data);
     }
 
@@ -243,7 +253,7 @@ const ScanQRCode = () => {
     navigation.goBack();
   };
 
-  const handleReadCode = (event: any) => {
+  const handleReadCode = (event: OnReadCodeData) => {
     onBarCodeRead({ data: event?.nativeEvent?.codeStringValue });
   };
 
@@ -311,7 +321,8 @@ const ScanQRCode = () => {
             selectTextOnFocus={false}
             keyboardType={Platform.OS === 'android' ? 'visible-password' : 'default'}
             value={backdoorText}
-            onChangeText={setBackdoorText}
+            // iOS smart punctuation turns straight quotes into curly ones, which breaks JSON payloads
+            onChangeText={text => setBackdoorText(text.replace(/[\u201C\u201D]/g, '"').replace(/[\u2018\u2019]/g, "'"))}
           />
           <Button title="OK" testID="scanQrBackdoorOkButton" onPress={handleBackdoorOkPress} />
         </View>

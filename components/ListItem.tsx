@@ -1,24 +1,44 @@
 import React, { useMemo } from 'react';
-import { Pressable, StyleProp, StyleSheet, Switch, SwitchProps, Text, TextStyle, View, ViewStyle } from 'react-native';
+import {
+  ActivityIndicator,
+  Pressable,
+  StyleProp,
+  StyleSheet,
+  Switch,
+  SwitchProps,
+  Text,
+  TextStyle,
+  useWindowDimensions,
+  View,
+  ViewStyle,
+} from 'react-native';
 import { useLocale } from '@react-navigation/native';
 
 import Icon from './Icon';
 import { useTheme } from './themes';
 
-interface ListItemProps {
+/** Base row height for transaction list `getItemLayout` (padding + title + subtitle at fontScale 1). */
+export const TX_ROW_BASE_HEIGHT = 64;
+
+export interface ListItemProps {
+  accessibilityLabel?: string;
+  accessibilityHint?: string;
   leftAvatar?: React.JSX.Element;
   containerStyle?: StyleProp<ViewStyle>;
   noFeedback?: boolean;
   bottomDivider?: boolean;
   testID?: string;
+  switchTestID?: string;
   onPress?: () => void;
   disabled?: boolean;
   switch?: SwitchProps;
   title: string;
+  titleStyle?: StyleProp<TextStyle>;
   subtitle?: string | React.ReactNode;
   subtitleNumberOfLines?: number;
   rightTitle?: string;
   rightTitleStyle?: StyleProp<TextStyle>;
+  rightTitleSelectable?: boolean;
   rightSubtitle?: string | React.ReactNode;
   rightSubtitleStyle?: StyleProp<TextStyle>;
   chevron?: boolean;
@@ -29,18 +49,23 @@ interface ListItemProps {
 const ListItem: React.FC<ListItemProps> = React.memo(
   ({
     leftAvatar,
+    accessibilityLabel,
+    accessibilityHint,
     containerStyle,
     noFeedback = false,
     bottomDivider = true,
     testID,
+    switchTestID,
     onPress,
     disabled,
     switch: switchProps,
     title,
+    titleStyle,
     subtitle,
     subtitleNumberOfLines,
     rightTitle,
     rightTitleStyle,
+    rightTitleSelectable,
     rightSubtitle,
     rightSubtitleStyle,
     chevron,
@@ -49,12 +74,20 @@ const ListItem: React.FC<ListItemProps> = React.memo(
   }: ListItemProps) => {
     const { colors } = useTheme();
     const { direction } = useLocale();
+    const { fontScale } = useWindowDimensions();
     const isRtl = direction === 'rtl';
+    const contentRowStyle = useMemo(
+      () => ({
+        paddingVertical: Math.round(12 * fontScale),
+      }),
+      [fontScale],
+    );
     const stylesHook = StyleSheet.create({
       title: {
         color: disabled ? colors.buttonDisabledTextColor : colors.foregroundColor,
         fontSize: 16,
         fontWeight: '500',
+        lineHeight: Math.round(22 * fontScale),
         writingDirection: direction,
       },
       rightMemoText: {
@@ -66,7 +99,7 @@ const ListItem: React.FC<ListItemProps> = React.memo(
         color: colors.alternativeTextColor,
         fontWeight: '400',
         paddingVertical: switchProps ? 8 : 0,
-        lineHeight: 20,
+        lineHeight: Math.round(20 * fontScale),
         fontSize: 14,
         marginTop: 2,
       },
@@ -83,10 +116,11 @@ const ListItem: React.FC<ListItemProps> = React.memo(
     const memoizedSwitchProps = useMemo(() => {
       return switchProps ? { ...switchProps } : undefined;
     }, [switchProps]);
+    const resolvedSwitchTestID = switchTestID ?? memoizedSwitchProps?.testID;
     const enableFeedback = !noFeedback && !!onPress && !disabled;
 
     const renderContent = () => (
-      <View style={styles.contentRow}>
+      <View style={[styles.contentRow, contentRowStyle]}>
         {leftAvatar && (
           <View style={styles.leftAvatarContainer}>
             {leftAvatar}
@@ -94,7 +128,7 @@ const ListItem: React.FC<ListItemProps> = React.memo(
           </View>
         )}
         <View style={styles.content}>
-          <Text style={stylesHook.title} numberOfLines={0} accessibilityRole="text">
+          <Text style={[stylesHook.title, titleStyle]} numberOfLines={0} accessibilityRole="text">
             {title}
           </Text>
           {subtitle ? (
@@ -107,7 +141,14 @@ const ListItem: React.FC<ListItemProps> = React.memo(
         {rightTitle || rightSubtitle ? (
           <View style={styles.rightColumn}>
             {rightTitle ? (
-              <Text style={rightTitleStyle} numberOfLines={1} accessibilityRole="text">
+              <Text
+                style={rightTitleStyle}
+                numberOfLines={1}
+                adjustsFontSizeToFit
+                minimumFontScale={0.75}
+                accessibilityRole="text"
+                selectable={rightTitleSelectable}
+              >
                 {rightTitle}
               </Text>
             ) : null}
@@ -120,17 +161,31 @@ const ListItem: React.FC<ListItemProps> = React.memo(
             ) : null}
           </View>
         ) : null}
-        {chevron ? (
-          <Icon name={isRtl ? 'angle-left' : 'angle-right'} type="font-awesome" color={colors.alternativeTextColor} size={18} />
-        ) : null}
-        {switchProps ? (
-          <Switch {...memoizedSwitchProps} accessibilityLabel={title} style={styles.margin16} accessible accessibilityRole="switch" />
-        ) : null}
-        {checkmark ? (
-          <View style={styles.checkmarkContainer}>
-            <Icon name="check" type="material-community" color={colors.foregroundColor} size={18} />
-          </View>
-        ) : null}
+        {isLoading ? (
+          <ActivityIndicator accessibilityRole="progressbar" />
+        ) : (
+          <>
+            {chevron ? (
+              <Icon name={isRtl ? 'angle-left' : 'angle-right'} type="font-awesome" color={colors.alternativeTextColor} size={18} />
+            ) : null}
+            {switchProps ? (
+              <Switch
+                {...memoizedSwitchProps}
+                testID={resolvedSwitchTestID}
+                accessibilityLabel={title}
+                accessibilityHint={typeof subtitle === 'string' ? subtitle : undefined}
+                style={styles.margin16}
+                accessible
+                accessibilityRole="switch"
+              />
+            ) : null}
+            {checkmark ? (
+              <View style={styles.checkmarkContainer}>
+                <Icon name="check" type="material-community" color={colors.foregroundColor} size={18} />
+              </View>
+            ) : null}
+          </>
+        )}
       </View>
     );
 
@@ -147,7 +202,11 @@ const ListItem: React.FC<ListItemProps> = React.memo(
         testID={testID}
         onPress={onPress}
         disabled={disabled}
+        accessible
         accessibilityRole="button"
+        accessibilityLabel={accessibilityLabel ?? title}
+        accessibilityHint={accessibilityHint}
+        accessibilityState={{ disabled: !!disabled }}
         android_ripple={enableFeedback ? { color: colors.androidRippleColor } : undefined}
         style={({ pressed }) => [
           stylesHook.containerStyle,
@@ -178,16 +237,20 @@ const styles = StyleSheet.create({
   },
   content: {
     flex: 1,
+    flexShrink: 1,
+    minWidth: 0,
     justifyContent: 'center',
   },
   leftAvatarContainer: {
     flexDirection: 'row',
     alignItems: 'center',
+    alignSelf: 'center',
   },
   rightColumn: {
     marginStart: 8,
-    minWidth: 0,
+    flexShrink: 0,
     alignItems: 'flex-end',
+    alignSelf: 'center',
   },
   rightMemoWrapper: {
     flexShrink: 1,

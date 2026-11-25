@@ -1,17 +1,18 @@
 import BigNumber from 'bignumber.js';
 import * as bitcoin from 'bitcoinjs-lib';
 import bitcoinMessage from 'bitcoinjs-message';
-import coinSelect, { CoinSelectOutput, CoinSelectReturnInput, CoinSelectTarget } from 'coinselect';
+import coinSelect, { CoinSelectOptions, CoinSelectOutput, CoinSelectReturnInput, CoinSelectTarget } from 'coinselect';
 import coinSelectSplit from 'coinselect/split';
 import { ECPairAPI, ECPairFactory, Signer } from 'ecpair';
 
 import * as BlueElectrum from '../../blue_modules/BlueElectrum';
 import ecc from '../../blue_modules/noble_ecc';
 import { hexToUint8Array, concatUint8Arrays } from '../../blue_modules/uint8array-extras';
-import { HDSegwitBech32Wallet } from '..';
+import type { HDSegwitBech32Wallet as HDSegwitBech32WalletT } from './hd-segwit-bech32-wallet';
 import { randomBytes } from '../rng';
 import { AbstractWallet } from './abstract-wallet';
 import { CreateTransactionResult, CreateTransactionTarget, CreateTransactionUtxo, Transaction, Utxo } from './types';
+import { errorMessage } from '../../helpers/errorMessage';
 const ECPair: ECPairAPI = ECPairFactory(ecc);
 bitcoin.initEccLib(ecc);
 
@@ -21,14 +22,19 @@ bitcoin.initEccLib(ecc);
  */
 export class LegacyWallet extends AbstractWallet {
   static readonly type = 'legacy';
-  static readonly typeReadable = 'Legacy (P2PKH)';
+  static readonly defaultTypeReadable = 'Legacy (P2PKH)';
   // @ts-ignore: override
   public readonly type = LegacyWallet.type;
-  // @ts-ignore: override
-  public readonly typeReadable = LegacyWallet.typeReadable;
+  public readonly typeReadable: string;
 
-  _txs_by_external_index: Transaction[] = [];
-  _txs_by_internal_index: Transaction[] = [];
+  _txs_by_external_index: Record<number, Transaction[]> = {};
+  _txs_by_internal_index: Record<number, Transaction[]> = {};
+
+  constructor(typeReadable?: string) {
+    super();
+
+    this.typeReadable = typeReadable ?? LegacyWallet.defaultTypeReadable;
+  }
 
   /**
    * Simple function which says that we havent tried to fetch balance
@@ -37,10 +43,7 @@ export class LegacyWallet extends AbstractWallet {
    * @return {boolean}
    */
   timeToRefreshBalance(): boolean {
-    if (+new Date() - this._lastBalanceFetch >= 5 * 60 * 1000) {
-      return true;
-    }
-    return false;
+    return +new Date() - this._lastBalanceFetch >= 5 * 60 * 1000;
   }
 
   /**
@@ -50,8 +53,11 @@ export class LegacyWallet extends AbstractWallet {
    * @return {boolean}
    */
   timeToRefreshTransaction(): boolean {
+    if (this._lastTxFetch >= +new Date() - 5 * 60 * 1000) {
+      return false;
+    }
     for (const tx of this.getTransactions()) {
-      if ((tx.confirmations ?? 0) < 7 && this._lastTxFetch < +new Date() - 5 * 60 * 1000) {
+      if ((tx.confirmations ?? 0) < 7) {
         return true;
       }
     }
@@ -292,7 +298,7 @@ export class LegacyWallet extends AbstractWallet {
           const inpVout = vin.vout;
           // got txid and output number of _previous_ transaction we shoud look into
 
-          if (vintxdatas[inpTxid] && vintxdatas[inpTxid].vout[inpVout]) {
+          if (inpTxid !== undefined && inpVout !== undefined && vintxdatas[inpTxid] && vintxdatas[inpTxid].vout[inpVout]) {
             return {
               ...vin,
               addresses: vintxdatas[inpTxid].vout[inpVout].scriptPubKey.addresses,
@@ -338,15 +344,18 @@ export class LegacyWallet extends AbstractWallet {
       }
     }
 
-    this._txs_by_external_index = _txsByExternalIndex;
+    this._txs_by_external_index = { 0: _txsByExternalIndex };
     this._lastTxFetch = +new Date();
   }
 
   getTransactions(): Transaction[] {
     // a hacky code reuse from electrum HD wallet:
-    this._txs_by_external_index = this._txs_by_external_index || [];
-    this._txs_by_internal_index = [];
+    this._txs_by_external_index = this._txs_by_external_index || {};
+    this._txs_by_internal_index = {};
 
+    const { HDSegwitBech32Wallet } = require('./hd-segwit-bech32-wallet') as {
+      HDSegwitBech32Wallet: typeof HDSegwitBech32WalletT;
+    };
     const hd = new HDSegwitBech32Wallet();
     return hd.getTransactions.apply(this);
   }
@@ -362,6 +371,31 @@ export class LegacyWallet extends AbstractWallet {
     console.log({ broadcast });
     if (broadcast.indexOf('successfully') !== -1) return true;
     return broadcast.length === 64; // this means return string is txid (precise length), so it was broadcasted ok
+  }
+
+  /**
+   * Whether size of at least one of the targets is overestimated by coinselect lib, comparing to its real scriptPubKey
+   */
+  _targetsAreOverestimated(targets: CreateTransactionTarget[]): boolean {
+    return targets.some(t => {
+      if (!t.address) return false;
+      const address = t.address.toLowerCase(); // bech32 addresses are case insensitive
+      const assumed = t.script?.length ?? 25; // lib assumes p2pkh
+      if (address.startsWith('sp1')) return assumed > 34; // silent payment ends up as p2tr output
+      try {
+        return assumed > bitcoin.address.toOutputScript(address.startsWith('bc1') ? address : t.address).length;
+      } catch (_) {
+        return false;
+      }
+    });
+  }
+
+  /**
+   * Length of the scriptPubKey of this wallet's change output, in bytes. Passed to coinselect lib when it is bigger than
+   * p2pkh (25 bytes), which is what the lib assumes
+   */
+  getChangeScriptLength(): number {
+    return this.segwitType === 'p2tr' ? 34 : 25;
   }
 
   coinselect(
@@ -382,6 +416,13 @@ export class LegacyWallet extends AbstractWallet {
     const _utxos = JSON.parse(JSON.stringify(utxos)) as CreateTransactionUtxo[];
     const _targets = JSON.parse(JSON.stringify(targets)) as CreateTransactionTarget[];
 
+    let isUncompressedKey = false;
+    if (!this.segwitType || this.segwitType === 'p2pkh') {
+      try {
+        isUncompressedKey = !ECPair.fromWIF(this.secret).compressed;
+      } catch (e) {}
+    }
+
     // compensating for coinselect inability to deal with segwit inputs, and overriding script length for proper vbytes calculation
     for (const u of _utxos) {
       if (u.script?.length) {
@@ -390,32 +431,55 @@ export class LegacyWallet extends AbstractWallet {
 
       // counting the number of vbytes for each script type:
       if (this.segwitType === 'p2wpkh') {
-        // 72 (high R low S signature) + 1 + 33 (comp pubkey) + 1 = 107 / 4 = 26.75 rounded up.
+        // witness: 1 (items count) + 1 + 72 (high R low S signature with sighash byte) + 1 + 33 (comp pubkey) = 108 / 4 = 27.
+        // exact for the biggest signature, no slack here
         u.script = { length: 27 };
       } else if (this.segwitType === 'p2sh(p2wpkh)') {
-        // ((72 (high R low S signature) + 1 + 33 (comp pubkey) + 1) / 4) + 22 (P2WPKH output on scriptSig stack) + 1 = 49.75 rounded up
+        // same 27 vbytes of witness as p2wpkh + 23 bytes of scriptSig (1 + 22 of P2WPKH output on scriptSig stack) = 50
         u.script = { length: 50 };
       } else if (this.segwitType === 'p2tr') {
         // taproot key path spend is just a 64 or 65 byte signature on the witness stack.
         // So it would be 65 bytes (assuming max size) + the pushbyte for 65 bytes on the stack, which makes 66.
         // 66 / 4 = 16.5 round up to 17
         u.script = { length: 17 };
+      } else if (isUncompressedKey) {
+        // 72 (high R low S signature) + 1 + 65 (uncomp pubkey) + 1 = 139
+        u.script = { length: 139 };
       }
     }
 
     for (const t of _targets) {
-      if (t.address?.startsWith('bc1')) {
+      // bech32 addresses are case insensitive
+      const address = t.address?.toLowerCase();
+      if (address?.startsWith('bc1')) {
         // in case address is non-typical and takes more bytes than coinselect library anticipates by default
-        t.script = { length: bitcoin.address.toOutputScript(t.address).length + 3 };
+        t.script = { length: bitcoin.address.toOutputScript(address).length + 3 };
+      } else if (address?.startsWith('sp1')) {
+        // silent payment address ends up as p2tr output (34 bytes), sizing it the same way as bc1p address above
+        t.script = { length: 34 + 3 };
       }
 
       if (t.script?.hex) {
         // setting length for coinselect lib manually as it is not aware of our field `hex`
-        t.script.length = t.script.hex.length / 2 - 4;
+        t.script.length = t.script.hex.length / 2;
       }
     }
 
-    const { inputs, outputs, fee } = algo(_utxos, _targets as CoinSelectTarget[], feeRate);
+    // coinselect lib assumes change output has 25 bytes script (p2pkh). if our change script is bigger (p2tr, p2wsh) we have
+    // to tell it, otherwise change output is not fully paid for and resulting feerate is lower than requested.
+    // smaller change scripts are left as is, that only makes us overestimate by 2-3 bytes
+    const changeScriptLength = this.getChangeScriptLength();
+    const options: CoinSelectOptions = {};
+    if (changeScriptLength > 25) options.changeScript = { length: changeScriptLength };
+
+    // coinselect lib is not aware of segwit marker & flag (2 bytes = 0.5 vbyte), and since vsize is rounded up the tx can end
+    // up 1 vbyte bigger than estimated. p2tr inputs are overestimated by 0.5 vbyte each, so only p2wpkh inputs are affected.
+    // we also dont need it when outputs are already overestimated (`+ 3` above; p2sh is 23 bytes while lib assumes 25)
+    if ((this.segwitType === 'p2wpkh' || this.segwitType === 'p2sh(p2wpkh)') && !this._targetsAreOverestimated(_targets)) {
+      options.txExtraBytes = 1;
+    }
+
+    const { inputs, outputs, fee } = algo(_utxos, _targets as CoinSelectTarget[], feeRate, options);
 
     // .inputs and .outputs will be undefined if no solution was found
     if (!inputs || !outputs) {
@@ -450,7 +514,6 @@ export class LegacyWallet extends AbstractWallet {
     sequence = sequence || 0xffffffff; // disable RBF by default
     const psbt = new bitcoin.Psbt();
     let c = 0;
-    const values: Record<number, number> = {};
     let keyPair: Signer | null = null;
 
     if (!skipSigning) {
@@ -459,7 +522,6 @@ export class LegacyWallet extends AbstractWallet {
     }
 
     inputs.forEach(input => {
-      values[c] = input.value;
       c++;
 
       if (!input.txhex) throw new Error('UTXO is missing txhex of the input, which is required by PSBT for non-segwit input');
@@ -503,11 +565,12 @@ export class LegacyWallet extends AbstractWallet {
   }
 
   getLatestTransactionTime(): string | 0 {
-    if (this.getTransactions().length === 0) {
+    const transactions = this.getTransactions();
+    if (transactions.length === 0) {
       return 0;
     }
     let max = 0;
-    for (const tx of this.getTransactions()) {
+    for (const tx of transactions) {
       max = Math.max(tx.timestamp ? tx.timestamp * 1000 : 0, max);
     }
     return new Date(max).toString();
@@ -565,7 +628,7 @@ export class LegacyWallet extends AbstractWallet {
     if (!address) return false;
     let cleanAddress = address;
 
-    if (this.segwitType === 'p2wpkh') {
+    if (this.segwitType === 'p2wpkh' || this.segwitType === 'p2tr') {
       cleanAddress = address.toLowerCase();
     }
 
@@ -644,8 +707,8 @@ export class LegacyWallet extends AbstractWallet {
     // undefined, true so it can verify Electrum signatures without errors
     try {
       return bitcoinMessage.verify(message, address, signature, undefined, true);
-    } catch (e: any) {
-      if (e.message === 'checkSegwitAlways can only be used with a compressed pubkey signature flagbyte') {
+    } catch (e) {
+      if (errorMessage(e) === 'checkSegwitAlways can only be used with a compressed pubkey signature flagbyte') {
         // If message created with uncompressed private key, it will throw this error
         // in this case we should re-try with checkSegwitAlways flag off
         // node_modules/bitcoinjs-message/index.js:187

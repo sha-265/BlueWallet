@@ -1,7 +1,7 @@
-import { RouteProp, StackActions, useIsFocused, useRoute } from '@react-navigation/native';
+import { useNavigation, RouteProp, StackActions, useIsFocused, useRoute } from '@react-navigation/native';
 import * as bitcoin from 'bitcoinjs-lib';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, ScrollView, StyleSheet, View } from 'react-native';
+import { ActivityIndicator, ScrollView, StyleSheet, View, TouchableOpacity } from 'react-native';
 import presentAlert from '../../components/Alert';
 import { DynamicQRCode } from '../../components/DynamicQRCode';
 import SaveFileButton from '../../components/SaveFileButton';
@@ -9,7 +9,6 @@ import { SquareButton } from '../../components/SquareButton';
 import { useTheme } from '../../components/themes';
 import loc from '../../loc';
 import TipBox from '../../components/TipBox';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import { SendDetailsStackParamList } from '../../navigation/SendDetailsStackParamList';
 import { BlueSpacing20 } from '../../components/BlueSpacing';
 import { isHexString } from '../../blue_modules/ur';
@@ -21,9 +20,9 @@ interface BarcodeScanResult {
 type RouteParams = RouteProp<SendDetailsStackParamList, 'PsbtMultisigQRCode'>;
 
 const PsbtMultisigQRCode: React.FC = () => {
-  const navigation = useExtendedNavigation();
+  const navigation = useNavigation();
   const { colors } = useTheme();
-  const openScannerButton = useRef<any>(null);
+  const openScannerButton = useRef<React.ElementRef<typeof TouchableOpacity>>(null);
   const { params } = useRoute<RouteParams>();
   const { psbtBase64, isShowOpenScanner, walletID } = params;
   const [isLoading, setIsLoading] = useState<boolean>(false);
@@ -53,8 +52,8 @@ const PsbtMultisigQRCode: React.FC = () => {
   }, [isFocused]);
 
   const onBarScanned = useCallback(
-    (ret: BarcodeScanResult | any) => {
-      const result = typeof ret === 'string' || ret instanceof String ? { data: ret } : ret;
+    (ret: BarcodeScanResult | string) => {
+      const result = typeof ret === 'string' ? { data: ret } : ret;
       const data = result.data || '';
 
       if (data.toUpperCase().startsWith('UR')) {
@@ -153,9 +152,9 @@ const PsbtMultisigQRCode: React.FC = () => {
             ref={openScannerButton}
             title={loc.multisig.scan_or_import_file}
           />
+          <BlueSpacing20 />
         </>
       )}
-      <BlueSpacing20 />
 
       {isLoading ? (
         <ActivityIndicator />
@@ -165,11 +164,12 @@ const PsbtMultisigQRCode: React.FC = () => {
           fileContent={psbt.toBase64()}
           beforeOnPress={saveFileButtonBeforeOnPress}
           afterOnPress={saveFileButtonAfterOnPress}
-          style={[styles.exportButton, stylesHook.exportButton]}
+          style={styles.shareButtonWrapper}
         >
-          <SquareButton title={loc.multisig.share} />
+          <SquareButton title={loc.multisig.share} style={[styles.exportButton, stylesHook.exportButton]} />
         </SaveFileButton>
       )}
+      <BlueSpacing20 />
     </ScrollView>
   );
 };
@@ -186,10 +186,13 @@ const styles = StyleSheet.create({
     backgroundColor: '#d2d2d2',
     marginVertical: 20,
   },
+  shareButtonWrapper: {
+    alignSelf: 'stretch',
+  },
   exportButton: {
     height: 48,
     borderRadius: 8,
-    flex: 1,
+    alignSelf: 'stretch',
     justifyContent: 'center',
     paddingHorizontal: 16,
   },

@@ -17,18 +17,11 @@ export class AbstractWallet {
   static readonly typeReadable = 'abstract';
   // @ts-ignore: override
   public readonly type = AbstractWallet.type;
-  // @ts-ignore: override
-  public readonly typeReadable = AbstractWallet.typeReadable;
+  public readonly typeReadable: string = AbstractWallet.typeReadable;
 
-  static fromJson(obj: string): AbstractWallet {
-    const obj2 = JSON.parse(obj);
-    const temp = new this();
-    for (const key2 of Object.keys(obj2)) {
-      // @ts-ignore This kind of magic is not allowed in typescript, we should try and be more specific
-      temp[key2] = obj2[key2];
-    }
-
-    return temp;
+  static fromJson<T extends object>(this: new () => T, obj: string): T {
+    const obj2: Record<string, unknown> = JSON.parse(obj);
+    return Object.assign(new this(), obj2);
   }
 
   segwitType?: 'p2wpkh' | 'p2sh(p2wpkh)' | 'p2tr' | 'p2pkh' /* not segwit but ok */;
@@ -124,14 +117,13 @@ export class AbstractWallet {
    * @returns {number} Available to spend amount, int, in sats
    */
   getBalance(): number {
-    return this.balance + (this.getUnconfirmedBalance() < 0 ? this.getUnconfirmedBalance() : 0);
+    const unconfirmed = this.getUnconfirmedBalance();
+    return this.balance + (unconfirmed < 0 ? unconfirmed : 0);
   }
 
   getPreferredBalanceUnit(): BitcoinUnit {
-    for (const value of Object.values(BitcoinUnit)) {
-      if (value === this.preferredBalanceUnit) {
-        return this.preferredBalanceUnit;
-      }
+    if (Object.values(BitcoinUnit).includes(this.preferredBalanceUnit)) {
+      return this.preferredBalanceUnit;
     }
     return BitcoinUnit.BTC;
   }
@@ -186,6 +178,17 @@ export class AbstractWallet {
 
   allowMasterFingerprint(): boolean {
     return false;
+  }
+
+  allowLnurlAuth(): boolean {
+    return false;
+  }
+
+  /**
+   * @returns private key used to sign LNURL-auth challenges from `domain`
+   */
+  getLnurlAuthLinkingKey(domain: string): Uint8Array {
+    throw new Error('getLnurlAuthLinkingKey: not implemented');
   }
 
   allowXpub(): boolean {
@@ -254,7 +257,7 @@ export class AbstractWallet {
       const xpub = this.secret.substring(xpubIndex).replace(/[()]/g, '').split('/')[0];
 
       const pathIndex = fpAndPath.indexOf('/');
-      const path = 'm' + fpAndPath.substring(pathIndex).replace(/h/g, "'");
+      const path = 'm' + fpAndPath.substring(pathIndex).replace(/[hH‘’]/g, "'");
       const fp = fpAndPath.substring(0, pathIndex);
 
       this._derivationPath = path;
@@ -284,7 +287,8 @@ export class AbstractWallet {
     const m = this.secret.match(re);
     if (m && m.length === 3) {
       let [hexFingerprint, ...derivationPathArray] = m[1].split('/');
-      const derivationPath = `m/${derivationPathArray.join('/').replace(/h/g, "'")}`;
+      // H is the same hardened bit as h; leaving it skips xpub to zpub and imports BIP84 as legacy 1...
+      const derivationPath = `m/${derivationPathArray.join('/').replace(/[hH‘’]/g, "'")}`;
       if (hexFingerprint.length === 8) {
         hexFingerprint = uint8ArrayToHex(hexToUint8Array(hexFingerprint).reverse());
         this.masterFingerprint = parseInt(hexFingerprint, 16);
@@ -329,7 +333,7 @@ export class AbstractWallet {
         }
         if (parsedSecret.keystore.derivation) {
           this._derivationPath = parsedSecret.keystore.derivation;
-          this._derivationPath = this._derivationPath?.replace(/h/g, "'");
+          this._derivationPath = this._derivationPath?.replace(/[hH‘’]/g, "'");
         }
         this.secret = parsedSecret.keystore.xpub;
         this.masterFingerprint = masterFingerprint;
@@ -383,7 +387,7 @@ export class AbstractWallet {
    * TODO: be more precise on the type
    */
 
-  createTx(): any {
+  createTx(): never {
     throw Error('not implemented');
   }
 
@@ -418,11 +422,11 @@ export class AbstractWallet {
   }
 
   getAddressAsync(): Promise<string | false | undefined> {
-    return new Promise(resolve => resolve(this.getAddress()));
+    return Promise.resolve(this.getAddress());
   }
 
   async getChangeAddressAsync(): Promise<string | false | undefined> {
-    return new Promise(resolve => resolve(this.getAddress()));
+    return Promise.resolve(this.getAddress());
   }
 
   useWithHardwareWalletEnabled(): boolean {
@@ -522,7 +526,7 @@ export class AbstractWallet {
   }
 
   getMasterFingerprintFromHex(hexValue: string): number {
-    if (hexValue.length < 8) hexValue = '0' + hexValue;
+    hexValue = hexValue.padStart(8, '0');
     const b = hexToUint8Array(hexValue);
     if (b.length !== 4) throw new Error('invalid fingerprint hex');
 

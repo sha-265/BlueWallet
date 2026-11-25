@@ -1,11 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { RouteProp, useFocusEffect, useRoute, useLocale } from '@react-navigation/native';
+import { useNavigation, CommonActions, RouteProp, useRoute, useLocale } from '@react-navigation/native';
 import { ActivityIndicator, Keyboard, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import Icon from '../../components/Icon';
 
 import { btcToSatoshi, fiatToBTC } from '../../blue_modules/currency';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
-import { BlueCard } from '../../BlueComponents';
+import BlueCard from '../../components/BlueCard';
 import Lnurl from '../../class/lnurl';
 import AddressInput from '../../components/AddressInput';
 import presentAlert from '../../components/Alert';
@@ -19,38 +19,41 @@ import { BitcoinUnit, Chain } from '../../models/bitcoinUnits';
 import { useStorage } from '../../hooks/context/useStorage';
 import { DismissKeyboardInputAccessory, DismissKeyboardInputAccessoryViewID } from '../../components/DismissKeyboardInputAccessory';
 import DeeplinkSchemaMatch from '../../class/deeplink-schema-match';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import { LNDStackParamsList } from '../../navigation/LNDStackParamsList';
+import { RootParamList } from '../../navigation/RootParamList';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { LightningCustodianWallet } from '../../class/wallets/lightning-custodian-wallet';
 import { DecodedInvoice, TWallet } from '../../class/wallets/types';
 import { useKeyboard } from '../../hooks/useKeyboard';
 import { BlueLoading } from '../../components/BlueLoading';
-import { LightningArkWallet } from '../../class';
+import { LightningArkWallet } from '../../class/wallets/lightning-ark-wallet';
+import { errorMessage } from '../../helpers/errorMessage';
+import { navigationRef } from '../../NavigationService';
 
 type RouteProps = RouteProp<LNDStackParamsList, 'ScanLNDInvoice'>;
-type NavigationProps = NativeStackNavigationProp<LNDStackParamsList, 'ScanLNDInvoice'>;
+type NavigationProps = NativeStackNavigationProp<RootParamList, 'ScanLNDInvoice'>;
 
 const ScanLNDInvoice = () => {
-  const { wallets, fetchAndSaveWalletTransactions } = useStorage();
+  const { wallets, fetchAndSaveWalletTransactions, addWallet, saveToDisk, setSharedCosigner } = useStorage();
   const { isBiometricUseCapableAndEnabled } = useBiometrics();
   const { colors } = useTheme();
   const { direction } = useLocale();
   const route = useRoute<RouteProps>();
-  const { walletID, uri, invoice } = route.params || {};
+  const { walletID, uri, openScanner } = route.params || {};
   const [wallet, setWallet] = useState<LightningCustodianWallet | undefined>(
-    (wallets.find(item => item.getID() === walletID) as LightningCustodianWallet) ||
-      (wallets.find(item => item.chain === Chain.OFFCHAIN) as LightningCustodianWallet),
+    wallets.find(item => item.getID() === walletID) as LightningCustodianWallet,
   );
-  const { navigate, setParams, goBack, pop } = useExtendedNavigation<NavigationProps>();
+  const { navigate, setParams, goBack, pop } = useNavigation<NavigationProps>();
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [renderWalletSelectionButtonHidden, setRenderWalletSelectionButtonHidden] = useState<boolean>(false);
   const [destination, setDestination] = useState<string>('');
   const [unit, setUnit] = useState<BitcoinUnit>(BitcoinUnit.SATS);
-  const [decoded, setDecoded] = useState<DecodedInvoice | undefined>();
+  // {} is the Ark-address sentinel: no invoice, but the form must render
+  const [decoded, setDecoded] = useState<Partial<DecodedInvoice> | undefined>();
   const [amount, setAmount] = useState<string | undefined>();
   const [isAmountInitiallyEmpty, setIsAmountInitiallyEmpty] = useState<boolean | undefined>();
   const [expiresIn, setExpiresIn] = useState<string | undefined>();
+  const [arkFeesReady, setArkFeesReady] = useState<boolean>(false);
   const stylesHook = StyleSheet.create({
     walletWrapLabel: {
       color: colors.buttonAlternativeTextColor,
@@ -78,27 +81,41 @@ const ScanLNDInvoice = () => {
       const newWallet = wallets.find(w => w.getID() === walletID) as LightningCustodianWallet;
       if (newWallet) {
         setWallet(newWallet);
+      } else {
+        goBack();
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [walletID]);
 
-  useFocusEffect(
-    useCallback(() => {
-      if (!wallet) {
-        triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
-        goBack();
-        setTimeout(
-          () => presentAlert({ message: loc.wallets.no_ln_wallet_error, hapticFeedback: HapticFeedbackTypes.NotificationError }),
-          500,
-        );
-      }
-      // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [wallet]),
-  );
+  useEffect(() => {
+    // Reset readiness whenever the selected wallet changes (or is not an Ark
+    // wallet) so a stale `true` from a previously-selected wallet never carries
+    // over to one whose fees are not loaded yet.
+    if (!(wallet instanceof LightningArkWallet)) {
+      setArkFeesReady(false);
+      return;
+    }
+    setArkFeesReady(false);
+    let cancelled = false;
+    wallet
+      .ensureLightningFeesLoaded()
+      .then(() => !cancelled && setArkFeesReady(true))
+      .catch(() => {}); // fee label is non-critical; stay silent and keep the line hidden
+    return () => {
+      cancelled = true;
+    };
+  }, [wallet]);
+
+  useEffect(() => {
+    if (!openScanner) return;
+    setParams({ openScanner: undefined });
+    navigate('ScanQRCode', { showFileImportButton: true });
+  }, [navigate, openScanner, setParams]);
 
   useEffect(() => {
     if (wallet && uri) {
+      if (Lnurl.isLnurlAuth(uri)) return processLnurlAuth(uri);
       if (Lnurl.isLnurl(uri)) return processLnurlPay(uri);
       if (Lnurl.isLightningAddress(uri)) return processLnurlPay(uri);
 
@@ -115,8 +132,7 @@ const ScanLNDInvoice = () => {
       if (data.toLowerCase().startsWith('ark1')) {
         const arkw = new LightningArkWallet();
         if (arkw.isAddressValid(data)) {
-          setParams({ uri: undefined, invoice: data });
-          // @ts-ignore we need it to be set to something
+          setParams({ uri: undefined });
           setDecoded({});
           setIsAmountInitiallyEmpty(true);
           setDestination(data);
@@ -140,18 +156,18 @@ const ScanLNDInvoice = () => {
         }
 
         Keyboard.dismiss();
-        setParams({ uri: undefined, invoice: data });
+        setParams({ uri: undefined });
         setIsAmountInitiallyEmpty(newDecoded.num_satoshis === 0);
         setDestination(data);
         setIsLoading(false);
         setAmount(newDecoded.num_satoshis.toString());
         setExpiresIn(newExpiresIn);
         setDecoded(newDecoded);
-      } catch (Err: any) {
+      } catch (Err) {
         triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
         Keyboard.dismiss();
         setParams({ uri: undefined });
-        setTimeout(() => presentAlert({ message: Err.message, hapticFeedback: HapticFeedbackTypes.NotificationError }), 10);
+        setTimeout(() => presentAlert({ message: errorMessage(Err), hapticFeedback: HapticFeedbackTypes.NotificationError }), 10);
         setIsLoading(false);
         setAmount(undefined);
         setDestination('');
@@ -173,20 +189,37 @@ const ScanLNDInvoice = () => {
   useKeyboard({ onKeyboardDidShow: _keyboardDidShow, onKeyboardDidHide: _keyboardDidHide });
 
   const processInvoice = (data: string): void => {
+    if (Lnurl.isLnurlAuth(data)) return processLnurlAuth(data);
     if (Lnurl.isLnurl(data)) return processLnurlPay(data);
     if (Lnurl.isLightningAddress(data)) return processLnurlPay(data);
     setParams({ uri: data });
   };
 
+  const processLnurlAuth = useCallback(
+    (data: string): void => {
+      // Close the modal first, then navigate to LnurlAuth in the drawer
+      goBack();
+      setTimeout(() => {
+        navigationRef.dispatch(
+          CommonActions.navigate('LnurlAuth', {
+            lnurl: data,
+            walletID: walletID || wallet?.getID(),
+          }),
+        );
+      }, 100);
+    },
+    [goBack, walletID, wallet],
+  );
+
   const processLnurlPay = (data: string): void => {
     navigate('LnurlPay', {
       lnurl: data,
-      walletID: walletID || wallet?.getID() || '',
+      walletID,
     });
   };
 
   const pay = async () => {
-    if (!decoded || !wallet || !amount || !invoice) {
+    if (!decoded || !wallet || !amount || !destination) {
       return null;
     }
 
@@ -212,7 +245,8 @@ const ScanLNDInvoice = () => {
     }
     setIsLoading(true);
 
-    const expiryTimeMs = (decoded.timestamp * 1 + decoded.expiry * 1) * 1000; // ms
+    // an Ark address sets decoded = {} with no invoice to expire
+    const expiryTimeMs = decoded.timestamp !== undefined ? (decoded.timestamp + (decoded.expiry ?? 0)) * 1000 : Infinity;
     if (+new Date() > expiryTimeMs) {
       setIsLoading(false);
       triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
@@ -227,12 +261,12 @@ const ScanLNDInvoice = () => {
     }
 
     try {
-      await wallet.payInvoice(invoice, amountSats);
-    } catch (Err: any) {
-      console.log(Err.message);
+      await wallet.payInvoice(destination, amountSats);
+    } catch (Err) {
+      console.log(errorMessage(Err));
       setIsLoading(false);
       triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
-      return presentAlert({ message: Err.message });
+      return presentAlert({ message: errorMessage(Err) });
     }
 
     navigate('Success', {
@@ -281,7 +315,7 @@ const ScanLNDInvoice = () => {
       <View style={styles.walletSelectRoot}>
         {!isLoading && (
           <TouchableOpacity accessibilityRole="button" style={styles.walletSelectTouch} onPress={naviageToSelectWallet}>
-            <Text style={styles.walletSelectText}>{loc.wallets.select_wallet.toLowerCase()}</Text>
+            <Text style={styles.walletSelectText}>{loc.wallets.select_wallet}</Text>
             <Icon name={direction === 'rtl' ? 'angle-left' : 'angle-right'} size={18} type="font-awesome" color="#9aa0aa" />
           </TouchableOpacity>
         )}
@@ -299,8 +333,22 @@ const ScanLNDInvoice = () => {
   };
 
   const getFees = (): string => {
-    if (!decoded) return '';
+    // Guard the amount, not just `decoded`: the Ark-address path sets
+    // `decoded = {}` (truthy) and amountless invoices leave num_satoshis
+    // 0/absent. The old `if (!decoded)` was safe only because getFees() used to
+    // be called solely inside the `num_satoshis > 0` JSX guard; the fee value is
+    // now hoisted unconditionally, so it must short-circuit here or
+    // `undefined.toString()` throws.
+    if (!decoded?.num_satoshis) return '';
     const num_satoshis = parseInt(decoded.num_satoshis.toString(), 10);
+
+    if (wallet instanceof LightningArkWallet) {
+      if (!arkFeesReady) return ''; // not loaded yet → fee line stays hidden until warm
+      const est = wallet.getSubmarineFeeEstimate(num_satoshis);
+      return est === undefined ? '' : `${est} ${BitcoinUnit.SATS}`;
+    }
+
+    // LightningCustodianWallet (LndHub): keep the legacy hardcoded estimate.
     const min = Math.floor(num_satoshis * 0.003);
     const max = Math.floor(num_satoshis * 0.01) + 1;
     return `${min} ${BitcoinUnit.SATS} - ${max} ${BitcoinUnit.SATS}`;
@@ -318,12 +366,17 @@ const ScanLNDInvoice = () => {
   const onBarScanned = useCallback(
     (value: string): void => {
       if (!value) return;
-      DeeplinkSchemaMatch.navigationRouteFor({ url: value }, (completionValue: any) => {
-        triggerHapticFeedback(HapticFeedbackTypes.NotificationSuccess);
-        navigate(...completionValue);
-      });
+      if (Lnurl.isLnurlAuth(value)) return processLnurlAuth(value);
+      DeeplinkSchemaMatch.navigationRouteFor(
+        { url: value },
+        completionValue => {
+          triggerHapticFeedback(HapticFeedbackTypes.NotificationSuccess);
+          navigate(...completionValue);
+        },
+        { wallets, addWallet, saveToDisk, setSharedCosigner, preferredWalletID: wallet?.getID() },
+      );
     },
-    [navigate],
+    [navigate, processLnurlAuth, wallets, addWallet, saveToDisk, setSharedCosigner, wallet],
   );
 
   useEffect(() => {
@@ -348,6 +401,12 @@ const ScanLNDInvoice = () => {
     );
   }
 
+  const feeText = getFees();
+  // Boltz publishes deterministic fees, so Arkade shows a single fixed amount
+  // under a definite label ("Network fee"), not a "potential" bracket. Custodial
+  // keeps the legacy "Potential fee" label + range.
+  const feeLabel = wallet instanceof LightningArkWallet ? loc.lnd.network_fee : loc.lnd.potentialFee;
+
   return (
     <SafeArea style={stylesHook.root}>
       <View style={[styles.root, stylesHook.root]}>
@@ -357,6 +416,7 @@ const ScanLNDInvoice = () => {
           automaticallyAdjustContentInsets
           automaticallyAdjustKeyboardInsets
           contentInsetAdjustmentBehavior="automatic"
+          scrollToOverflowEnabled
         >
           <View style={styles.scrollMargin}>
             <AmountInput.AmountInput
@@ -364,7 +424,7 @@ const ScanLNDInvoice = () => {
               amount={amount}
               onAmountUnitChange={setUnit}
               onChangeText={setAmount}
-              disabled={!isAmountInitiallyEmpty || !decoded || isLoading || decoded.num_satoshis > 0}
+              disabled={!isAmountInitiallyEmpty || !decoded || isLoading || (decoded.num_satoshis ?? 0) > 0}
               unit={unit}
               inputAccessoryViewID={DismissKeyboardInputAccessoryViewID}
             />
@@ -389,8 +449,8 @@ const ScanLNDInvoice = () => {
             {expiresIn !== undefined && (
               <View>
                 <Text style={stylesHook.expiresIn}>{expiresIn}</Text>
-                {decoded && decoded.num_satoshis > 0 && (
-                  <Text style={stylesHook.expiresIn}>{loc.formatString(loc.lnd.potentialFee, { fee: getFees() })}</Text>
+                {decoded && (decoded.num_satoshis ?? 0) > 0 && feeText !== '' && (
+                  <Text style={stylesHook.expiresIn}>{loc.formatString(feeLabel, { fee: feeText })}</Text>
                 )}
               </View>
             )}

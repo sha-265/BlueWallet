@@ -1,65 +1,148 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
-import { RouteProp, useFocusEffect, useRoute } from '@react-navigation/native';
+import Clipboard from '@react-native-clipboard/clipboard';
+import useScreenMenuActions from '../../hooks/useScreenMenuActions';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useNavigation, RouteProp, useFocusEffect, useRoute } from '@react-navigation/native';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
-import { BackHandler, Platform, StyleSheet, Text, View } from 'react-native';
-import Animated, { Layout } from 'react-native-reanimated';
+import { BackHandler, Pressable, StyleSheet, Text, useColorScheme, View } from 'react-native';
+import Animated, { Easing, Layout, useAnimatedStyle, useSharedValue, withDelay, withTiming } from 'react-native-reanimated';
 import Share from 'react-native-share';
 import * as BlueElectrum from '../../blue_modules/BlueElectrum';
 import { fiatToBTC, satoshiToBTC } from '../../blue_modules/currency';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
 import { majorTomToGroundControl, tryToObtainPermissions } from '../../blue_modules/notifications';
-import { BlueButtonLink, BlueCard, BlueText } from '../../BlueComponents';
+import AddressLabelBadge from '../../components/AddressLabelBadge';
+import BlueButtonLink from '../../components/BlueButtonLink';
+import BlueCard from '../../components/BlueCard';
+import BlueText from '../../components/BlueText';
 import DeeplinkSchemaMatch from '../../class/deeplink-schema-match';
 import presentAlert from '../../components/Alert';
 import Button from '../../components/Button';
-import CopyTextToClipboard from '../../components/CopyTextToClipboard';
+import CopyTextToClipboard, { CopyTextToClipboardHandle } from '../../components/CopyTextToClipboard';
 import HandOffComponent from '../../components/HandOffComponent';
-import HeaderMenuButton from '../../components/HeaderMenuButton';
-import QRCodeComponent from '../../components/QRCodeComponent';
-import SegmentedControl from '../../components/SegmentControl';
+import QRCode from '../../components/QRCode';
+import SegmentedControl from '../../components/SegmentedControl';
 import { useTheme } from '../../components/themes';
-import TipBox from '../../components/TipBox';
 import { TransactionPendingIconBig } from '../../components/TransactionPendingIconBig';
 import { HandOffActivityType } from '../../components/types';
 import { useSettings } from '../../hooks/context/useSettings';
 import { useStorage } from '../../hooks/context/useStorage';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import loc, { formatBalance } from '../../loc';
 import { BitcoinUnit, Chain } from '../../models/bitcoinUnits';
 import { ReceiveDetailsStackParamList } from '../../navigation/ReceiveDetailsStackParamList';
-import { CommonToolTipActions } from '../../typings/CommonToolTipActions';
 import { SuccessView } from '../send/success';
 import { BlueSpacing40 } from '../../components/BlueSpacing';
 import { BlueLoading } from '../../components/BlueLoading';
 import SafeAreaScrollView from '../../components/SafeAreaScrollView';
+import { isIOS26OrHigher } from '../../blue_modules/environment';
 
 const segmentControlValues = [loc.wallets.details_address, loc.bip47.payment_code];
-const HORIZONTAL_PADDING = 20;
 
-type StickyHeaderProps = {
-  wallet: any;
-  isBIP47Enabled: boolean;
-  tabValues: string[];
-  currentTab: string;
-  setCurrentTab: (tab: string) => void;
-  backgroundColor: string;
+// Tappable receive card layout constants. Kept in one place because the QR
+// size depends on subtracting all the surrounding paddings/margins.
+const CARD_HORIZONTAL_MARGIN = 24;
+const CARD_INTERNAL_PADDING = 6;
+const QR_CARD_PADDING = 6;
+const MAX_QR_SIZE = 500;
+const MIN_QR_SIZE = 120;
+const QR_SCROLL_RESERVED_WIDTH = (CARD_HORIZONTAL_MARGIN + CARD_INTERNAL_PADDING + QR_CARD_PADDING) * 2;
+const QR_PORTRAIT_HEIGHT_FRACTION = 0.44;
+const QR_LANDSCAPE_HEIGHT_FRACTION = 0.52;
+const QR_WIDTH_USE_FRACTION = 0.92;
+
+/** Staggered “reveal” for the QR: white tiles fade out in random order */
+const QR_STAGGER_GRID = 5;
+const QR_STAGGER_MAX_DELAY_MS = 420;
+const QR_STAGGER_TILE_DURATION_MS = 400;
+
+/** Deterministic stagger delays for a given payload key */
+function staggerDelaysForRunKey(runKey: string, tileCount: number, maxDelayMs: number): number[] {
+  const delays: number[] = [];
+  for (let i = 0; i < tileCount; i++) {
+    let n = 0;
+    const s = `${runKey}:${i}`;
+    for (let j = 0; j < s.length; j++) {
+      n = (n * 31 + s.charCodeAt(j) * (j + 1)) % 2147483647;
+    }
+    delays.push(n % maxDelayMs);
+  }
+  return delays;
+}
+
+const receiveAuxStyles = StyleSheet.create({
+  qrRevealTile: {
+    position: 'absolute',
+  },
+  qrStaggerHost: {
+    overflow: 'hidden',
+  },
+});
+
+type QrRevealTileProps = {
+  width: number;
+  height: number;
+  left: number;
+  top: number;
+  maskColor: string;
+  delayMs: number;
+  runKey: string;
 };
 
-const StickyHeader = React.memo(({ wallet, isBIP47Enabled, tabValues, currentTab, setCurrentTab, backgroundColor }: StickyHeaderProps) => {
-  if (!wallet || !isBIP47Enabled) return null;
+const QrRevealTile: React.FC<QrRevealTileProps> = ({ width, height, left, top, maskColor, delayMs, runKey }) => {
+  const opacity = useSharedValue(1);
+  useEffect(() => {
+    opacity.value = 1;
+    opacity.value = withDelay(delayMs, withTiming(0, { duration: QR_STAGGER_TILE_DURATION_MS, easing: Easing.out(Easing.quad) }));
+  }, [runKey, delayMs, opacity]);
+  const tileStyle = useAnimatedStyle(() => ({ opacity: opacity.value }));
+  return (
+    <Animated.View
+      pointerEvents="none"
+      style={[receiveAuxStyles.qrRevealTile, { left, top, width, height, backgroundColor: maskColor }, tileStyle]}
+    />
+  );
+};
+
+type QrStaggerRevealProps = {
+  size: number;
+  maskColor: string;
+  runKey: string;
+  children: React.ReactNode;
+};
+
+const QrStaggerReveal: React.FC<QrStaggerRevealProps> = ({ size, maskColor, runKey, children }) => {
+  const delays = useMemo(() => staggerDelaysForRunKey(runKey, QR_STAGGER_GRID * QR_STAGGER_GRID, QR_STAGGER_MAX_DELAY_MS), [runKey]);
+  const g = QR_STAGGER_GRID;
+  const qx = Math.floor(size / g);
+  const extraX = size - qx * g;
+  const qy = Math.floor(size / g);
+  const extraY = size - qy * g;
+  const tileW = (c: number) => (c === g - 1 ? qx + extraX : qx);
+  const tileH = (r: number) => (r === g - 1 ? qy + extraY : qy);
+  const left = (c: number) => c * qx;
+  const top = (r: number) => r * qy;
 
   return (
-    <View style={[styles.tabsContainer, { backgroundColor }]}>
-      <SegmentedControl
-        values={tabValues}
-        selectedIndex={tabValues.findIndex(tab => tab === currentTab)}
-        onChange={index => {
-          setCurrentTab(tabValues[index]);
-        }}
-      />
+    <View style={[receiveAuxStyles.qrStaggerHost, { width: size, height: size }]}>
+      {children}
+      {delays.map((delayMs, i) => {
+        const row = Math.floor(i / g);
+        const col = i % g;
+        return (
+          <QrRevealTile
+            key={`${runKey}-${i}`}
+            width={tileW(col)}
+            height={tileH(row)}
+            left={left(col)}
+            top={top(row)}
+            maskColor={maskColor}
+            delayMs={delayMs}
+            runKey={runKey}
+          />
+        );
+      })}
     </View>
   );
-});
+};
 
 type NavigationProps = NativeStackNavigationProp<ReceiveDetailsStackParamList, 'ReceiveDetails'>;
 type RouteProps = RouteProp<ReceiveDetailsStackParamList, 'ReceiveDetails'>;
@@ -67,9 +150,10 @@ type RouteProps = RouteProp<ReceiveDetailsStackParamList, 'ReceiveDetails'>;
 const ReceiveDetails = () => {
   const route = useRoute<RouteProps>();
   const { walletID, address } = route.params;
-  const { wallets, saveToDisk, sleep, fetchAndSaveWalletTransactions } = useStorage();
+  const { wallets, saveToDisk, sleep, fetchAndSaveWalletTransactions, addressMetadata } = useStorage();
   const { isElectrumDisabled } = useSettings();
   const { colors } = useTheme();
+  const isDarkTheme = useColorScheme() === 'dark';
   const [customLabel, setCustomLabel] = useState('');
   const [customAmount, setCustomAmount] = useState('');
   const [customUnit, setCustomUnit] = useState<BitcoinUnit>(BitcoinUnit.BTC);
@@ -79,7 +163,7 @@ const ReceiveDetails = () => {
   const [showConfirmedBalance, setShowConfirmedBalance] = useState(false);
   const [showAddress, setShowAddress] = useState(false);
   const [currentTab, setCurrentTab] = useState(segmentControlValues[0]);
-  const { goBack, setParams, setOptions, navigate } = useExtendedNavigation<NavigationProps>();
+  const { goBack, setParams, navigate } = useNavigation<NavigationProps>();
   const [intervalMs, setIntervalMs] = useState(5000);
   const [eta, setEta] = useState('');
   const [initialConfirmed, setInitialConfirmed] = useState(0);
@@ -89,6 +173,11 @@ const ReceiveDetails = () => {
 
   const wallet = walletID ? wallets.find(w => w.getID() === walletID) : undefined;
   const isBIP47Enabled = wallet?.isBIP47Enabled();
+
+  const paymentCodeString = useMemo(() => (wallet && 'getBIP47PaymentCode' in wallet && wallet.getBIP47PaymentCode()) || '', [wallet]);
+
+  /** Dark: theme input surface (#262626) reads softer than pure elevated / system gray 6. Light: iOS-style grouped background. */
+  const cardBackgroundColor = isDarkTheme ? colors.inputBackgroundColor : '#F2F2F7';
 
   const stylesHook = StyleSheet.create({
     root: {
@@ -100,7 +189,46 @@ const ReceiveDetails = () => {
     label: {
       color: colors.foregroundColor,
     },
+    receiveCard: {
+      backgroundColor: cardBackgroundColor,
+    },
+    /** Total width: QR + white card padding + gray card horizontal padding (each side). */
+    receiveCardColumn: {
+      width: qrCodeSize + QR_CARD_PADDING * 2 + CARD_INTERNAL_PADDING * 2,
+    },
+    bip47NotFound: {
+      color: colors.foregroundColor,
+    },
+    qrPlaceholderFill: {
+      backgroundColor: isDarkTheme ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.04)',
+    },
   });
+
+  const copyRef = useRef<CopyTextToClipboardHandle>(null);
+  useScreenMenuActions({
+    copyAddress:
+      showAddress && currentTab === segmentControlValues[0] && !!address
+        ? () => {
+            Clipboard.setString(address);
+            triggerHapticFeedback(HapticFeedbackTypes.ImpactLight);
+          }
+        : undefined,
+  });
+  const scrollLayoutRef = useRef({ width: 0, height: 0 });
+  const pressScale = useSharedValue(1);
+  const pressAnimatedStyle = useAnimatedStyle(() => ({
+    transform: [{ scale: pressScale.value }],
+  }));
+  const handlePressIn = useCallback(() => {
+    pressScale.value = withTiming(0.97, { duration: 110, easing: Easing.out(Easing.quad) });
+  }, [pressScale]);
+  const handlePressOut = useCallback(() => {
+    pressScale.value = withTiming(1, { duration: 140, easing: Easing.out(Easing.quad) });
+  }, [pressScale]);
+  const handleCardPress = useCallback(() => {
+    triggerHapticFeedback(HapticFeedbackTypes.ImpactLight);
+    copyRef.current?.copy({ suppressHaptic: true });
+  }, []);
 
   const setAddressBIP21Encoded = useCallback(
     (addr: string) => {
@@ -143,7 +271,8 @@ const ReceiveDetails = () => {
           newAddress = wallet.getAddress();
         }
       } else {
-        saveToDisk(); // caching whatever getAddressAsync() generated internally
+        // caching whatever getAddressAsync() generated internally
+        saveToDisk().catch((error: unknown) => console.warn('ReceiveDetails: saveToDisk failed', error));
       }
     } else {
       try {
@@ -156,7 +285,8 @@ const ReceiveDetails = () => {
         console.warn('either sleep expired or getAddressAsync threw an exception');
         newAddress = wallet.getAddress();
       } else {
-        saveToDisk(); // caching whatever getAddressAsync() generated internally
+        // caching whatever getAddressAsync() generated internally
+        saveToDisk().catch((error: unknown) => console.warn('ReceiveDetails: saveToDisk failed', error));
       }
     }
 
@@ -175,14 +305,6 @@ const ReceiveDetails = () => {
     }
   }, [wallet, saveToDisk, address, setAddressBIP21Encoded, isElectrumDisabled, sleep]);
 
-  const onEnablePaymentsCodeSwitchValue = useCallback(() => {
-    if (wallet && wallet.allowBIP47()) {
-      wallet.switchBIP47(!wallet.isBIP47Enabled());
-    }
-    saveToDisk();
-    obtainWalletAddress();
-  }, [wallet, saveToDisk, obtainWalletAddress]);
-
   useEffect(() => {
     if (showConfirmedBalance) {
       triggerHapticFeedback(HapticFeedbackTypes.NotificationSuccess);
@@ -195,27 +317,13 @@ const ReceiveDetails = () => {
     }
   }, [address, isCustom, setAddressBIP21Encoded]);
 
-  const toolTipActions = useMemo(() => {
-    const action = { ...CommonToolTipActions.PaymentsCode };
-    action.menuState = isBIP47Enabled;
-    return [action];
-  }, [isBIP47Enabled]);
+  // Derived read: the label sheet mutates addressMetadata in place, and saving re-renders this screen.
+  const addressLabel = address ? (addressMetadata[address]?.label ?? '') : '';
 
-  const onPressMenuItem = useCallback(() => {
-    onEnablePaymentsCodeSwitchValue();
-  }, [onEnablePaymentsCodeSwitchValue]);
-
-  const HeaderRight = useMemo(
-    () => <HeaderMenuButton actions={toolTipActions} onPressMenuItem={onPressMenuItem} />,
-    [onPressMenuItem, toolTipActions],
-  );
-
-  useEffect(() => {
-    wallet?.allowBIP47() &&
-      setOptions({
-        headerRight: () => HeaderRight,
-      });
-  }, [HeaderRight, colors.foregroundColor, setOptions, wallet]);
+  const navigateToAddressLabel = useCallback(() => {
+    if (!address) return;
+    navigate('ReceiveAddressLabel', { address });
+  }, [address, navigate]);
 
   // re-fetching address balance periodically
   useEffect(() => {
@@ -344,73 +452,152 @@ const ReceiveDetails = () => {
     );
   };
 
-  const onLayout = useCallback((e: { nativeEvent: { layout: { height: number; width: number } } }) => {
-    const { height, width } = e.nativeEvent.layout;
+  const recomputeQrCodeSize = useCallback(() => {
+    const { width: sw, height: sh } = scrollLayoutRef.current;
+    if (sw <= 0 || sh <= 0) return;
 
-    const isPortrait = height > width;
-    const maxQRSize = 500;
-
-    if (isPortrait) {
-      const heightBasedSize = Math.min(height * 0.6, maxQRSize);
-      const widthBasedSize = width * 0.85 - HORIZONTAL_PADDING * 2;
-      setQRCodeSize(Math.min(heightBasedSize, widthBasedSize));
-    } else {
-      const heightBasedSize = Math.min(height * 0.7, maxQRSize);
-      const widthBasedSize = width * 0.45;
-      setQRCodeSize(Math.min(heightBasedSize, widthBasedSize));
-    }
+    const isPortrait = sh > sw;
+    const heightCap = Math.min(isPortrait ? sh * QR_PORTRAIT_HEIGHT_FRACTION : sh * QR_LANDSCAPE_HEIGHT_FRACTION, MAX_QR_SIZE);
+    const widthBudget = sw - QR_SCROLL_RESERVED_WIDTH;
+    const innerWidthCap = Math.max(MIN_QR_SIZE, Math.floor(widthBudget * QR_WIDTH_USE_FRACTION));
+    const size = Math.max(MIN_QR_SIZE, Math.min(innerWidthCap, heightCap, MAX_QR_SIZE));
+    setQRCodeSize(Math.round(size));
   }, []);
 
-  const renderTabContent = () => {
-    if (currentTab === segmentControlValues[0]) {
-      return (
-        <View style={styles.container}>
-          {address && (
-            <View style={styles.scrollBody}>
-              {isCustom && (
-                <>
-                  {getDisplayAmount() && (
-                    <BlueText testID="BitcoinAmountText" style={[styles.amount, stylesHook.amount]} numberOfLines={1}>
-                      {getDisplayAmount()}
-                    </BlueText>
-                  )}
-                  {customLabel?.length > 0 && (
-                    <BlueText testID="CustomAmountDescriptionText" style={[styles.label, stylesHook.label]} numberOfLines={1}>
-                      {customLabel}
-                    </BlueText>
-                  )}
-                </>
-              )}
-              <View style={styles.qrCodeContainer}>
-                <QRCodeComponent value={bip21encoded} size={qrCodeSize} />
-              </View>
-              <CopyTextToClipboard text={isCustom ? bip21encoded : address} isAddress={true} />
+  const onScrollViewLayout = useCallback(
+    (e: { nativeEvent: { layout: { height: number; width: number } } }) => {
+      const { height, width } = e.nativeEvent.layout;
+      scrollLayoutRef.current = { width, height };
+      recomputeQrCodeSize();
+    },
+    [recomputeQrCodeSize],
+  );
+
+  const toBalancedMultilineText = useCallback((value: string) => {
+    const normalized = value.replace(/\n/g, '');
+    if (normalized.length <= 1) return normalized;
+    const midpoint = Math.ceil(normalized.length / 2);
+    return `${normalized.slice(0, midpoint)}\n${normalized.slice(midpoint)}`;
+  }, []);
+
+  const showReceiveSkeleton = !showAddress && !showPendingBalance && !showConfirmedBalance && Boolean(wallet ?? route.params.address);
+
+  const renderReceiveSkeleton = () => {
+    const showTabs = Boolean(wallet && isBIP47Enabled);
+    return (
+      <View style={styles.cardPressable} testID="ReceiveCardSkeleton">
+        <View style={[styles.receiveCard, stylesHook.receiveCard, stylesHook.receiveCardColumn]}>
+          {showTabs && (
+            <View style={styles.tabsInsideCard} onStartShouldSetResponder={() => true}>
+              <SegmentedControl
+                values={segmentControlValues}
+                selectedIndex={segmentControlValues.findIndex(tab => tab === currentTab)}
+                onChange={index => setCurrentTab(segmentControlValues[index])}
+              />
             </View>
           )}
+          <View style={styles.qrCardWrapper}>
+            <View style={[styles.qrPlaceholder, stylesHook.qrPlaceholderFill, { width: qrCodeSize, height: qrCodeSize }]} />
+          </View>
         </View>
-      );
+      </View>
+    );
+  };
+
+  const renderReceiveCard = () => {
+    const isAddressTab = currentTab === segmentControlValues[0];
+
+    let qrValue: string | undefined;
+    let copyText: string | undefined;
+
+    if (isAddressTab) {
+      if (!address) return null;
+      qrValue = bip21encoded;
+      copyText = isCustom ? bip21encoded : address;
     } else if (wallet && isBIP47Enabled) {
-      // wallet is always defined here
-      const qrValue =
-        'getBIP47PaymentCode' in wallet && typeof wallet.getBIP47PaymentCode === 'function' ? wallet.getBIP47PaymentCode() : undefined;
-      return (
-        <View style={styles.container}>
-          {qrValue ? (
-            <>
-              <TipBox description={loc.receive.bip47_explanation} containerStyle={styles.tip} />
-              <View style={styles.qrCodeContainer}>
-                <QRCodeComponent value={qrValue} size={qrCodeSize} />
-              </View>
-              <CopyTextToClipboard text={qrValue} truncated={false} />
-            </>
-          ) : (
-            <Text>{loc.bip47.not_found}</Text>
-          )}
-        </View>
-      );
-    } else {
-      return null;
+      qrValue = paymentCodeString || undefined;
+      copyText = paymentCodeString || undefined;
     }
+
+    const showTabs = Boolean(wallet && isBIP47Enabled);
+    const showTip = !isAddressTab && Boolean(qrValue);
+    const showCustomAmount = isAddressTab && isCustom;
+    const displayCopyText = copyText && isAddressTab ? toBalancedMultilineText(copyText) : undefined;
+
+    return (
+      <Pressable
+        onPress={handleCardPress}
+        onPressIn={handlePressIn}
+        onPressOut={handlePressOut}
+        disabled={!copyText}
+        style={styles.cardPressable}
+        accessibilityRole="button"
+        accessibilityLabel={loc.transactions.details_copy}
+        testID="ReceiveCard"
+      >
+        <Animated.View style={[styles.receiveCard, stylesHook.receiveCard, stylesHook.receiveCardColumn, pressAnimatedStyle]}>
+          {showTabs && (
+            <View
+              style={styles.tabsInsideCard}
+              // Keep tab interactions local: tapping segmented control should not
+              // trigger the parent receive-card copy press.
+              onStartShouldSetResponder={() => true}
+            >
+              <SegmentedControl
+                values={segmentControlValues}
+                selectedIndex={segmentControlValues.findIndex(tab => tab === currentTab)}
+                onChange={index => setCurrentTab(segmentControlValues[index])}
+              />
+            </View>
+          )}
+
+          {showTip && <BlueText style={[styles.paymentCodeDescription, stylesHook.label]}>{loc.receive.bip47_explanation}</BlueText>}
+
+          {showCustomAmount && (
+            <View style={styles.customAmountWrapper}>
+              {getDisplayAmount() && (
+                <BlueText testID="BitcoinAmountText" style={[styles.amount, stylesHook.amount]} numberOfLines={1}>
+                  {getDisplayAmount()}
+                </BlueText>
+              )}
+              {customLabel?.length > 0 && (
+                <BlueText testID="CustomAmountDescriptionText" style={[styles.label, stylesHook.label]} numberOfLines={1}>
+                  {customLabel}
+                </BlueText>
+              )}
+            </View>
+          )}
+
+          {qrValue ? (
+            <View style={styles.qrCardWrapper}>
+              <QrStaggerReveal size={qrCodeSize} maskColor="#FFFFFF" runKey={`${currentTab}|${qrValue}`}>
+                <QRCode value={qrValue} size={qrCodeSize} />
+              </QrStaggerReveal>
+            </View>
+          ) : (
+            <View style={styles.bip47NotFoundContainer}>
+              <Text style={stylesHook.bip47NotFound}>{loc.bip47.not_found}</Text>
+            </View>
+          )}
+
+          {copyText && (
+            <>
+              <View style={styles.cardSpacer} />
+              <View style={styles.addressRow}>
+                <CopyTextToClipboard
+                  ref={copyRef}
+                  text={copyText}
+                  displayText={displayCopyText}
+                  isAddress={isAddressTab}
+                  truncated={false}
+                  interactive={false}
+                />
+              </View>
+            </>
+          )}
+        </Animated.View>
+      </Pressable>
+    );
   };
 
   const hasIncomingCustomParams =
@@ -443,9 +630,9 @@ const ReceiveDetails = () => {
     }, [wallet, address, obtainWalletAddress, setAddressBIP21Encoded, isCustom, hasIncomingCustomParams]),
   );
 
-  const showCustomAmountModal = useCallback(() => {
+  const showMoreOptionsSheet = useCallback(() => {
     if (!address) return;
-    navigate('ReceiveCustomAmount', {
+    navigate('ReceiveMoreOptions', {
       address,
       currentLabel: customLabel,
       currentAmount: customAmount,
@@ -520,20 +707,24 @@ const ReceiveDetails = () => {
     }
   };
 
-  const handleShareButtonPressed = () => {
-    let message: string | false = false;
-    if (currentTab === segmentControlValues[0]) {
-      message = bip21encoded;
-    } else {
-      message = (wallet && 'getBIP47PaymentCode' in wallet && wallet.getBIP47PaymentCode()) ?? false;
-    }
+  const shareMessage = currentTab === segmentControlValues[0] ? bip21encoded : paymentCodeString;
 
-    if (!message) {
+  useEffect(() => {
+    if (!isIOS26OrHigher) return;
+
+    const headerShareMessage = shareMessage || undefined;
+    if (route.params.headerShareMessage !== headerShareMessage) {
+      setParams({ headerShareMessage });
+    }
+  }, [route.params.headerShareMessage, setParams, shareMessage]);
+
+  const handleShareButtonPressed = () => {
+    if (!shareMessage) {
       presentAlert({ title: loc.errors.error, message: loc.bip47.not_found });
       return;
     }
 
-    Share.open({ message }).catch(error => console.debug('Error sharing:', error));
+    Share.open({ message: shareMessage }).catch(error => console.debug('Error sharing:', error));
   };
 
   return (
@@ -547,27 +738,26 @@ const ReceiveDetails = () => {
         style={stylesHook.root}
         contentContainerStyle={[styles.root, stylesHook.root]}
         keyboardShouldPersistTaps="always"
-        onLayout={onLayout}
-        stickyHeaderIndices={wallet && isBIP47Enabled ? [0] : []}
+        onLayout={onScrollViewLayout}
       >
-        {wallet && isBIP47Enabled && (
-          <StickyHeader
-            wallet={wallet}
-            isBIP47Enabled={isBIP47Enabled}
-            tabValues={segmentControlValues}
-            currentTab={currentTab}
-            setCurrentTab={setCurrentTab}
-            backgroundColor={colors.elevated}
+        {showAddress && renderReceiveCard()}
+        {showAddress && currentTab === segmentControlValues[0] && addressLabel ? (
+          <AddressLabelBadge
+            label={addressLabel}
+            style={styles.addressLabelPill}
+            onPress={navigateToAddressLabel}
+            accessibilityLabel={`${loc.receive.option_label}: ${addressLabel}`}
+            testID="ReceiveAddressLabel"
           />
-        )}
-        {showAddress && renderTabContent()}
+        ) : null}
+        {showReceiveSkeleton && renderReceiveSkeleton()}
         {showAddress && address !== undefined && (
           <HandOffComponent title={loc.send.details_address} type={HandOffActivityType.ReceiveOnchain} userInfo={{ address }} />
         )}
         {showConfirmedBalance && renderConfirmedBalance()}
         {showPendingBalance && renderPendingBalance()}
 
-        {!showAddress && !showPendingBalance && !showConfirmedBalance && (
+        {!showAddress && !showPendingBalance && !showConfirmedBalance && !showReceiveSkeleton && (
           <View style={styles.loadingContainer}>
             <BlueLoading />
           </View>
@@ -578,16 +768,18 @@ const ReceiveDetails = () => {
             {showAddress && currentTab === loc.wallets.details_address && (
               <BlueButtonLink
                 style={styles.link}
-                testID="SetCustomAmountButton"
-                title={loc.receive.details_setAmount}
-                onPress={showCustomAmountModal}
+                testID="ReceiveMoreOptionsButton"
+                title={loc.receive.details_more_options}
+                onPress={showMoreOptionsSheet}
               />
             )}
-            <Button
-              onPress={handleShareButtonPressed}
-              title={loc.receive.details_share}
-              disabled={!bip21encoded && !(currentTab === segmentControlValues[1] && isBIP47Enabled)}
-            />
+            {!isIOS26OrHigher && (
+              <Button
+                onPress={handleShareButtonPressed}
+                title={loc.receive.details_share}
+                disabled={!bip21encoded && !(currentTab === segmentControlValues[1] && isBIP47Enabled)}
+              />
+            )}
           </BlueCard>
         </View>
       </SafeAreaScrollView>
@@ -602,13 +794,6 @@ const styles = StyleSheet.create({
   },
   flex: {
     flex: 1,
-  },
-  tabsContainer: {
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingHorizontal: 16,
-    paddingVertical: 8,
-    backgroundColor: Platform.OS === 'ios' ? 'transparent' : undefined,
   },
   scrollBody: {
     flex: 1,
@@ -634,20 +819,73 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     paddingBottom: 12,
   },
-  container: {
-    flex: 1,
-    alignItems: 'center',
-    justifyContent: 'center',
+  cardPressable: {
+    alignSelf: 'center',
+    marginHorizontal: CARD_HORIZONTAL_MARGIN,
+    marginTop: 56,
+    marginBottom: 8,
   },
-  tip: {
-    marginHorizontal: 16,
-    borderRadius: 12,
-    padding: 16,
-  },
-  qrCodeContainer: {
+  receiveCard: {
+    borderRadius: 26,
+    paddingHorizontal: CARD_INTERNAL_PADDING,
+    paddingTop: CARD_INTERNAL_PADDING,
+    paddingBottom: 16,
     alignItems: 'center',
-    justifyContent: 'center',
+  },
+  tabsInsideCard: {
     width: '100%',
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    paddingBottom: 8,
+  },
+  paymentCodeDescription: {
+    alignSelf: 'stretch',
+    textAlign: 'left',
+    paddingHorizontal: 8,
+    paddingTop: 4,
+    paddingBottom: 8,
+  },
+  customAmountWrapper: {
+    width: '100%',
+    paddingHorizontal: 8,
+    paddingTop: 8,
+  },
+  qrCardWrapper: {
+    backgroundColor: '#FFFFFF',
+    borderRadius: 20,
+    padding: QR_CARD_PADDING,
+    alignSelf: 'center',
+    alignItems: 'center',
+    justifyContent: 'center',
+    shadowColor: '#000000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.12,
+    shadowRadius: 12,
+    elevation: 4,
+  },
+  qrPlaceholder: {
+    borderRadius: 4,
+  },
+  cardSpacer: {
+    height: 24,
+  },
+  addressRow: {
+    alignSelf: 'stretch',
+    marginHorizontal: -CARD_INTERNAL_PADDING,
+    paddingHorizontal: 16,
+    minHeight: 48,
+    justifyContent: 'center',
+  },
+  addressLabelPill: {
+    alignSelf: 'center',
+    maxWidth: '86%',
+    paddingHorizontal: 14,
+    paddingVertical: 7,
+    marginTop: 8,
+  },
+  bip47NotFoundContainer: {
+    paddingVertical: 40,
+    alignItems: 'center',
   },
   loadingContainer: {
     flex: 1,

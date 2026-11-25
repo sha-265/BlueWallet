@@ -1,3 +1,4 @@
+import { useNavigation } from '@react-navigation/native';
 import React, { useMemo, useCallback, useEffect, useRef } from 'react';
 import Clipboard from '@react-native-clipboard/clipboard';
 import { StyleSheet, Text, View } from 'react-native';
@@ -8,20 +9,20 @@ import { unlockWithBiometrics, useBiometrics } from '../../hooks/useBiometrics';
 import loc, { formatBalance } from '../../loc';
 import { BitcoinUnit } from '../../models/bitcoinUnits';
 import presentAlert from '../Alert';
-import QRCodeComponent from '../QRCodeComponent';
 import { useTheme } from '../themes';
+import AddressLabelBadge from '../AddressLabelBadge';
 import { AddressTypeBadge } from './AddressTypeBadge';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
 import { useStorage } from '../../hooks/context/useStorage';
 import ToolTipMenu from '../TooltipMenu';
 import { CommonToolTipActions } from '../../typings/CommonToolTipActions';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import HighlightedText from '../HighlightedText';
 import { useSharedValue, withSpring, withTiming } from 'react-native-reanimated';
+import { errorMessage } from '../../helpers/errorMessage';
 
 interface AddressItemProps {
-  item: any;
+  item: { key?: string; index: number; address: string; isInternal: boolean; balance?: number; transactions?: number };
   balanceUnit: BitcoinUnit;
   walletID: string;
   allowSignVerifyMessage: boolean;
@@ -41,14 +42,15 @@ const AddressItem = ({
   searchQuery = '',
   renderHighlightedText,
 }: AddressItemProps) => {
-  const { wallets } = useStorage();
-  const { colors } = useTheme();
+  const { wallets, addressMetadata } = useStorage();
+  const addressLabel = addressMetadata[item.address]?.label;
+  const { colors, dark } = useTheme();
   const { isBiometricUseCapableAndEnabled } = useBiometrics();
   const balanceOpacity = useSharedValue(1);
   const balanceTranslateY = useSharedValue(0);
   const previousBalance = useRef<string | undefined>(undefined);
 
-  const hasTransactions = item.transactions > 0;
+  const hasTransactions = (item.transactions ?? 0) > 0;
 
   const stylesHook = StyleSheet.create({
     container: {
@@ -64,11 +66,11 @@ const AddressItem = ({
       color: colors.alternativeTextColor,
     },
     address: {
-      color: hasTransactions ? colors.darkGray : colors.buttonTextColor,
+      color: dark ? colors.foregroundColor : colors.darkGray,
     },
   });
 
-  const { navigate } = useExtendedNavigation<NavigationProps>();
+  const { navigate } = useNavigation<NavigationProps>();
 
   const navigateToReceive = useCallback(() => {
     if (onPress) {
@@ -93,7 +95,7 @@ const AddressItem = ({
 
   const menuActions = useMemo(
     () => [
-      CommonToolTipActions.CopyTXID,
+      { ...CommonToolTipActions.CopyToClipboard, text: loc.menu.copy_address },
       CommonToolTipActions.Share,
       {
         ...CommonToolTipActions.SignVerify,
@@ -107,7 +109,7 @@ const AddressItem = ({
     [allowSignVerifyMessage],
   );
 
-  const balance = formatBalance(item.balance, balanceUnit, true);
+  const balance = formatBalance(item.balance ?? 0, balanceUnit, true);
 
   useEffect(() => {
     if (previousBalance.current !== undefined && previousBalance.current !== balance) {
@@ -143,14 +145,14 @@ const AddressItem = ({
       }
       triggerHapticFeedback(HapticFeedbackTypes.Selection);
       Clipboard.setString(wif);
-    } catch (error: any) {
-      presentAlert({ message: error.message });
+    } catch (error) {
+      presentAlert({ message: errorMessage(error) });
     }
   }, [wallets, walletID, item.address]);
 
   const onToolTipPress = useCallback(
     async (id: string) => {
-      if (id === CommonToolTipActions.CopyTXID.id) {
+      if (id === CommonToolTipActions.CopyToClipboard.id) {
         handleCopyPress();
       } else if (id === CommonToolTipActions.Share.id) {
         handleSharePress();
@@ -169,8 +171,6 @@ const AddressItem = ({
     },
     [handleCopyPress, handleSharePress, navigateToSignVerify, handleCopyPrivkeyPress, isBiometricUseCapableAndEnabled],
   );
-
-  const renderPreview = useCallback(() => <QRCodeComponent value={item.address} isMenuAvailable={false} />, [item.address]);
 
   // Render address with highlighting if a search query is provided
   const renderAddressContent = () => {
@@ -201,8 +201,6 @@ const AddressItem = ({
       title={item.address}
       actions={menuActions}
       onPressMenuItem={onToolTipPress}
-      // Revisit once RNMenu has renderPreview prop
-      renderPreview={renderPreview}
       onPress={navigateToReceive}
       isButton
       buttonStyle={styles.tooltipButton}
@@ -219,7 +217,10 @@ const AddressItem = ({
           </View>
         </View>
         <View style={styles.rightContainer}>
-          <AddressTypeBadge isInternal={item.isInternal} hasTransactions={hasTransactions} />
+          <View style={styles.badgesRow}>
+            <AddressTypeBadge isInternal={item.isInternal} hasTransactions={hasTransactions} />
+            {addressLabel ? <AddressLabelBadge label={addressLabel} style={styles.labelBadge} /> : null}
+          </View>
           <Text style={[stylesHook.balance, styles.balance]}>
             {loc.addresses.transactions}: {item.transactions ?? 0}
           </Text>
@@ -240,6 +241,14 @@ const styles = StyleSheet.create({
   address: {
     fontWeight: 'bold',
     marginHorizontal: 4,
+  },
+  badgesRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  labelBadge: {
+    maxWidth: 110,
   },
   tooltipButton: {
     width: '100%',

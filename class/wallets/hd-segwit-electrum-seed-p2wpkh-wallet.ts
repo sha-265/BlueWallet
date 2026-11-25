@@ -1,10 +1,8 @@
 import BIP32Factory from 'bip32';
 import * as bitcoin from 'bitcoinjs-lib';
-import b58 from 'bs58check';
 import * as mn from 'electrum-mnemonic';
 
 import ecc from '../../blue_modules/noble_ecc';
-import { concatUint8Arrays, hexToUint8Array } from '../../blue_modules/uint8array-extras';
 import { HDSegwitBech32Wallet } from './hd-segwit-bech32-wallet';
 
 const bip32 = BIP32Factory(ecc);
@@ -26,7 +24,6 @@ export class HDSegwitElectrumSeedP2WPKHWallet extends HDSegwitBech32Wallet {
   static readonly typeReadable = 'HD Electrum (BIP32 P2WPKH)';
   // @ts-ignore: override
   public readonly type = HDSegwitElectrumSeedP2WPKHWallet.type;
-  // @ts-ignore: override
   public readonly typeReadable = HDSegwitElectrumSeedP2WPKHWallet.typeReadable;
   static readonly derivationPath = "m/0'";
 
@@ -52,10 +49,7 @@ export class HDSegwitElectrumSeedP2WPKHWallet extends HDSegwitBech32Wallet {
     const xpub = root.derivePath("m/0'").neutered().toBase58();
 
     // bitcoinjs does not support zpub yet, so we just convert it from xpub
-    let data = b58.decode(xpub);
-    data = data.slice(4);
-    const concatenated = concatUint8Arrays([hexToUint8Array('04b24746'), data]);
-    this._xpub = b58.encode(concatenated);
+    this._xpub = this._xpubToZpub(xpub);
 
     return this._xpub;
   }
@@ -90,6 +84,12 @@ export class HDSegwitElectrumSeedP2WPKHWallet extends HDSegwitBech32Wallet {
     }
 
     return (this.external_addresses_cache[index] = address);
+  }
+
+  _getBip32Root() {
+    const args: SeedOpts = { prefix: PREFIX };
+    if (this.passphrase) args.passphrase = this.passphrase;
+    return bip32.fromSeed(mn.mnemonicToSeedSync(this.secret, args));
   }
 
   _getWIFByIndex(internal: boolean, index: number): string | false {

@@ -5,7 +5,11 @@ import RNFS from 'react-native-fs';
 import Realm from 'realm';
 import { sha256 as _sha256 } from '@noble/hashes/sha256';
 
-import { LegacyWallet, SegwitBech32Wallet, SegwitP2SHWallet, TaprootWallet } from '../class';
+import type { LegacyWallet as LegacyWalletT } from '../class/wallets/legacy-wallet';
+import type { SegwitBech32Wallet as SegwitBech32WalletT } from '../class/wallets/segwit-bech32-wallet';
+import type { SegwitP2SHWallet as SegwitP2SHWalletT } from '../class/wallets/segwit-p2sh-wallet';
+import type { TaprootWallet as TaprootWalletT } from '../class/wallets/taproot-wallet';
+import type { TransactionInput, TransactionOutput, Utxo } from '../class/wallets/types';
 import presentAlert from '../components/Alert';
 import loc from '../loc';
 import { GROUP_IO_BLUEWALLET } from './currency';
@@ -13,6 +17,7 @@ import { ElectrumServerItem } from '../screen/settings/ElectrumSettings';
 import { triggerWarningHapticFeedback } from './hapticFeedback';
 import { AlertButton } from 'react-native';
 import { uint8ArrayToHex, stringToUint8Array, hexToUint8Array } from './uint8array-extras/index';
+import { errorMessage } from '../helpers/errorMessage';
 import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 
 const ElectrumClient = require('electrum-client');
@@ -20,16 +25,7 @@ const net = require('net');
 const tls = require('tls');
 const navigation = useExtendedNavigation();
 
-type Utxo = {
-  height: number;
-  value: number;
-  address: string;
-  txid: string;
-  vout: number;
-  wif?: string;
-};
-
-type ElectrumTransaction = {
+export type ElectrumTransaction = {
   txid: string;
   hash: string;
   version: number;
@@ -37,33 +33,17 @@ type ElectrumTransaction = {
   vsize: number;
   weight: number;
   locktime: number;
-  vin: {
-    txid: string;
-    vout: number;
-    scriptSig: { asm: string; hex: string };
-    txinwitness: string[];
-    sequence: number;
-    addresses?: string[];
-    value?: number;
-  }[];
-  vout: {
-    value: number;
-    n: number;
-    scriptPubKey: {
-      asm: string;
-      hex: string;
-      reqSigs: number;
-      type: string;
-      addresses: string[];
-    };
-  }[];
-  blockhash: string;
-  confirmations: number;
-  time: number;
-  blocktime: number;
+  fee?: number;
+  vin: TransactionInput[];
+  vout: TransactionOutput[];
+  // Confirmation-only fields: absent on mempool (unconfirmed) responses.
+  blockhash?: string;
+  confirmations?: number;
+  time?: number;
+  blocktime?: number;
 };
 
-type ElectrumTransactionWithHex = ElectrumTransaction & {
+export type ElectrumTransactionWithHex = ElectrumTransaction & {
   hex: string;
 };
 
@@ -99,16 +79,91 @@ export const suggestedServers: Peer[] = hardcodedPeers.map(peer => ({
 }));
 
 let mainClient: typeof ElectrumClient | undefined;
-let mainConnected: boolean = false;
-let wasConnectedAtLeastOnce: boolean = false;
 let serverName: string | false = false;
 let disableBatching: boolean = false;
-let connectionAttempt: number = 0;
 let currentPeerIndex = hardcodedPeers.findIndex(peer => peer.host === defaultPeer.host && peer.ssl === defaultPeer.ssl);
 if (currentPeerIndex < 0) currentPeerIndex = 0;
 let latestBlock: { height: number; time: number } | { height: undefined; time: undefined } = { height: undefined, time: undefined };
+
+// --- Single source of truth for connection liveness -----------------------------
+// We previously tracked `mainConnected` (boolean) separately from the client's own
+// `mainClient.status`. They drifted on iOS suspend/resume: a transient `ping()`
+// failure cleared the flag while the socket was still alive, then `waitTillConnected`
+// blocked for ~30s on the stale flag and surfaced a false network-error alert. The
+// state machine + `ensureConnected()` below is the only place that mutates the
+// connection lifecycle, and UI is driven by subscribing to state changes.
+
+export type ConnectionState = 'disabled' | 'disconnected' | 'connecting' | 'connected';
+let connState: ConnectionState = 'disconnected';
+type ConnectionListener = (state: ConnectionState) => void;
+const connectionListeners = new Set<ConnectionListener>();
+
+function setConnectionState(next: ConnectionState): void {
+  if (connState === next) return;
+  connState = next;
+  for (const l of connectionListeners) {
+    try {
+      l(next);
+    } catch (e) {
+      console.warn('[electrum] connection listener threw:', e);
+    }
+  }
+}
+
+/** Current connection state for UI. */
+export function getConnectionState(): ConnectionState {
+  return connState;
+}
+
+/** Subscribe to state changes. Returns an unsubscribe function. */
+export function subscribeConnectionState(listener: ConnectionListener): () => void {
+  connectionListeners.add(listener);
+  return () => {
+    connectionListeners.delete(listener);
+  };
+}
+
+/** Convenience: `true` iff a usable Electrum connection is currently believed to exist. */
+export function isConnected(): boolean {
+  return connState === 'connected';
+}
+
+// --- Connection lifecycle internals ---------------------------------------------
+/** One liveness check (`server_ping`) wall-time before giving up and marking the socket dead. */
+const PING_TIMEOUT_MS = 5_000;
+/** One full connect attempt (TLS + `server_version` handshake) wall-time before retrying. */
+const CONNECT_ATTEMPT_TIMEOUT_MS = 10_000;
+/** Reconnect attempts inside a single `ensureConnected()` call before declaring failure. */
+const CONNECT_MAX_ATTEMPTS = 5;
+/** Backoff between attempts to avoid hammering a flaky server. */
+const CONNECT_BACKOFF_MS = 500;
+/** Delay before the auto-reconnect triggered by a live-socket `onError`. Onions are slower. */
+const RECONNECT_ONION_DELAY_MS = 4_000;
+const RECONNECT_TCP_DELAY_MS = 500;
+
+/** Max wall time one `ensureConnected()` call may take when no live socket exists. */
+export const ENSURE_CONNECTED_MAX_WALL_MS =
+  CONNECT_MAX_ATTEMPTS * CONNECT_ATTEMPT_TIMEOUT_MS + (CONNECT_MAX_ATTEMPTS - 1) * CONNECT_BACKOFF_MS;
+
+/** Coalesces concurrent `ensureConnected()` callers — at most one connect attempt at a time. */
+let ensureInFlight: Promise<boolean> | null = null;
+/** If any coalesced caller asked for the failure alert, honour it once the in-flight attempt finishes. */
+let ensureInFlightShowAlert = false;
+
+/**
+ * Bumps every time the caller asks us to abandon the current connection
+ * (`forceDisconnect()` or user disabling Electrum). In-flight `ensureConnected()`
+ * checks this between attempts so it can bail out promptly instead of racing back
+ * to `connected` after a disconnect was requested.
+ */
+let disconnectGeneration = 0;
 const txhashHeightCache: Record<string, number> = {};
 let _realm: Realm | undefined;
+
+type TCacheRow = {
+  cache_key: string;
+  cache_value: string;
+};
 
 function bitcoinjs_crypto_sha256(buffer: Uint8Array): Uint8Array {
   return _sha256(buffer);
@@ -123,7 +178,7 @@ async function _getRealm() {
   const encryptionKey = Int8Array.from(buf);
   const path = `${cacheFolderPath}/electrumcache.realm`; // Use cache folder path
 
-  const schema = [
+  const schema: Realm.ObjectSchema[] = [
     {
       name: 'Cache',
       primaryKey: 'cache_key',
@@ -134,7 +189,6 @@ async function _getRealm() {
     },
   ];
 
-  // @ts-ignore schema doesn't match Realm's schema type
   _realm = await Realm.open({
     schema,
     path,
@@ -152,10 +206,10 @@ export const getPreferredServer = async (): Promise<ElectrumServerItem | undefin
     const tcpPort = await DefaultPreference.get(ELECTRUM_TCP_PORT);
     const sslPort = await DefaultPreference.get(ELECTRUM_SSL_PORT);
 
-    console.log('Getting preferred server:', { host, tcpPort, sslPort });
+    console.log('[electrum] Getting preferred server:', { host, tcpPort, sslPort });
 
     if (!host) {
-      console.warn('Preferred server host is undefined');
+      console.warn('[electrum] Preferred server host is undefined');
       return;
     }
 
@@ -165,7 +219,7 @@ export const getPreferredServer = async (): Promise<ElectrumServerItem | undefin
       ssl: sslPort ? Number(sslPort) : undefined,
     };
   } catch (error) {
-    console.error('Error in getPreferredServer:', error);
+    console.error('[electrum] Error in getPreferredServer:', error);
     return undefined;
   }
 };
@@ -173,12 +227,12 @@ export const getPreferredServer = async (): Promise<ElectrumServerItem | undefin
 export const removePreferredServer = async () => {
   try {
     await DefaultPreference.setName(GROUP_IO_BLUEWALLET);
-    console.log('Removing preferred server');
+    console.log('[electrum] Removing preferred server');
     await DefaultPreference.clear(ELECTRUM_HOST);
     await DefaultPreference.clear(ELECTRUM_TCP_PORT);
     await DefaultPreference.clear(ELECTRUM_SSL_PORT);
   } catch (error) {
-    console.error('Error in removePreferredServer:', error);
+    console.error('[electrum] Error in removePreferredServer:', error);
   }
 };
 
@@ -187,14 +241,14 @@ export async function isDisabled(): Promise<boolean> {
   try {
     await DefaultPreference.setName(GROUP_IO_BLUEWALLET);
     const savedValue = await DefaultPreference.get(ELECTRUM_CONNECTION_DISABLED);
-    console.log('Getting Electrum connection disabled state:', savedValue);
+    console.log('[electrum] Getting Electrum connection disabled state:', savedValue);
     if (savedValue === null) {
       result = false;
     } else {
       result = savedValue;
     }
   } catch (error) {
-    console.error('Error getting Electrum connection disabled state:', error);
+    console.error('[electrum] Error getting Electrum connection disabled state:', error);
     result = false;
   }
   return !!result;
@@ -202,8 +256,23 @@ export async function isDisabled(): Promise<boolean> {
 
 export async function setDisabled(disabled = true) {
   await DefaultPreference.setName(GROUP_IO_BLUEWALLET);
-  console.log('Setting Electrum connection disabled state to:', disabled);
-  return DefaultPreference.set(ELECTRUM_CONNECTION_DISABLED, disabled ? '1' : '');
+  console.log('[electrum] Setting Electrum connection disabled state to:', disabled);
+  const result = await DefaultPreference.set(ELECTRUM_CONNECTION_DISABLED, disabled ? '1' : '');
+  // Disabling must abort any in-flight ensureConnected() and tear down the live
+  // socket so callers don't have to remember to pair this with forceDisconnect().
+  // Without bumping the generation, an in-flight connect could race back to
+  // 'connected' after the user toggled Electrum off.
+  if (disabled) {
+    disconnectGeneration += 1;
+    if (mainClient) {
+      try {
+        mainClient.close();
+      } catch {}
+      mainClient = undefined;
+    }
+    setConnectionState('disabled');
+  }
+  return result;
 }
 
 function getCurrentPeer() {
@@ -227,7 +296,7 @@ async function getSavedPeer(): Promise<Peer | null> {
     const tcpPort = await DefaultPreference.get(ELECTRUM_TCP_PORT);
     const sslPort = await DefaultPreference.get(ELECTRUM_SSL_PORT);
 
-    console.log('Getting saved peer:', { host, tcpPort, sslPort });
+    console.log('[electrum] Getting saved peer:', { host, tcpPort, sslPort });
 
     if (!host) {
       return null;
@@ -243,53 +312,98 @@ async function getSavedPeer(): Promise<Peer | null> {
 
     return null;
   } catch (error) {
-    console.error('Error in getSavedPeer:', error);
+    console.error('[electrum] Error in getSavedPeer:', error);
     return null;
   }
 }
 
-export async function connectMain(): Promise<void> {
-  if (await isDisabled()) {
-    console.log('Electrum connection disabled by user. Skipping connectMain call');
-    return;
-  }
+/** Resolve to the peer this attempt should target (preferred saved peer, or rotate hardcoded list). */
+async function pickPeer(): Promise<Peer> {
   let usingPeer = getNextPeer();
   const savedPeer = await getSavedPeer();
   if (savedPeer && savedPeer.host && (savedPeer.tcp || savedPeer.ssl)) {
     usingPeer = savedPeer;
   }
+  return usingPeer;
+}
 
-  console.log('Using peer:', JSON.stringify(usingPeer));
+function scheduleReconnectFromClient(client: typeof ElectrumClient, usingPeer: Peer, reason: string): void {
+  if (connState !== 'connected' || mainClient !== client) return;
+
+  console.log(`[electrum] scheduling Electrum reconnect after ${reason}`);
+  try {
+    // Also neutralises electrum-client's own timers/reconnect hooks for this instance.
+    client.close();
+  } catch {}
+  if (mainClient === client) mainClient = undefined;
+  setConnectionState('disconnected');
+
+  const delay = usingPeer.host.endsWith('.onion') ? RECONNECT_ONION_DELAY_MS : RECONNECT_TCP_DELAY_MS;
+  const generationAtSchedule = disconnectGeneration;
+  setTimeout(() => {
+    if (generationAtSchedule !== disconnectGeneration) return;
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define -- defined later in file
+    ensureConnected().catch(() => {
+      /* ensureConnected never throws, but be defensive */
+    });
+  }, delay);
+}
+
+/**
+ * One connect attempt: build a fresh `ElectrumClient`, run the version handshake,
+ * subscribe to headers. No retries, no UI side effects. Returns the peer used
+ * (for caller-side telemetry/alerts) and whether the attempt succeeded.
+ */
+async function attemptConnectOnce(): Promise<{ ok: boolean; peer: Peer }> {
+  const usingPeer = await pickPeer();
+  console.log('[electrum] Using peer:', JSON.stringify(usingPeer));
+
+  // Drop any prior client before allocating a new one. Closing also neutralises
+  // electrum-client's internal `reconnect()` loop on the old instance.
+  if (mainClient) {
+    try {
+      mainClient.close();
+    } catch {}
+    mainClient = undefined;
+  }
 
   try {
-    console.log('begin connection:', JSON.stringify(usingPeer));
-    mainClient = new ElectrumClient(net, tls, usingPeer.ssl || usingPeer.tcp, usingPeer.host, usingPeer.ssl ? 'tls' : 'tcp');
+    console.log('[electrum] begin connection:', JSON.stringify(usingPeer));
+    const client = new ElectrumClient(net, tls, usingPeer.ssl || usingPeer.tcp, usingPeer.host, usingPeer.ssl ? 'tls' : 'tcp');
+    mainClient = client;
 
-    mainClient.onError = function (e: { message: string }) {
-      console.log('electrum mainClient.onError():', e.message);
-      if (mainConnected) {
-        // most likely got a timeout from electrum ping. lets reconnect
-        // but only if we were previously connected (mainConnected), otherwise theres other
-        // code which does connection retries
-        mainClient?.close();
-        mainClient = undefined;
-        mainConnected = false;
-        // dropping `mainConnected` flag ensures there wont be reconnection race condition if several
-        // errors triggered
-        console.log('reconnecting after socket error');
-        setTimeout(connectMain, usingPeer.host.endsWith('.onion') ? 4000 : 500);
-      }
+    // Live-socket errors after a successful handshake: schedule a single
+    // `ensureConnected()` (deduped). Errors during this attempt's own handshake
+    // are caught below — we must not double-handle them here.
+    client.onError = function (e: { message: string }) {
+      console.log('[electrum] electrum mainClient.onError():', e.message);
+      scheduleReconnectFromClient(client, usingPeer, 'socket error');
     };
-    const ver = await mainClient.initElectrum({ client: 'bluewallet', version: '1.4' });
+
+    const ver = await Promise.race([
+      client.initElectrum(
+        { client: 'bluewallet', version: '1.4' },
+        {
+          maxRetry: 0,
+          callback: () => scheduleReconnectFromClient(client, usingPeer, 'socket close'),
+        },
+      ),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('connect timeout')), CONNECT_ATTEMPT_TIMEOUT_MS)),
+    ]);
+
+    if (mainClient !== client) {
+      // Caller raced `forceDisconnect()` while we were awaiting. Bail.
+      try {
+        client.close();
+      } catch {}
+      return { ok: false, peer: usingPeer };
+    }
+
     if (ver && ver[0]) {
-      console.log('connected to ', ver);
+      console.log('[electrum] connected to ', ver);
       serverName = ver[0];
-      mainConnected = true;
-      wasConnectedAtLeastOnce = true;
       if (ver[0].startsWith('ElectrumPersonalServer') || ver[0].startsWith('electrs') || ver[0].startsWith('Fulcrum')) {
         disableBatching = true;
-
-        // exeptions for versions:
         const [electrumImplementation, electrumVersion] = ver[0].split(' ');
         switch (electrumImplementation) {
           case 'electrs':
@@ -298,8 +412,6 @@ export async function connectMain(): Promise<void> {
             }
             break;
           case 'electrs-esplora':
-            // its a different one, and it does NOT support batching
-            // nop
             break;
           case 'Fulcrum':
             if (semVerToInt(electrumVersion) >= semVerToInt('1.9.0')) {
@@ -308,35 +420,157 @@ export async function connectMain(): Promise<void> {
             break;
         }
       }
-      const header = await mainClient.blockchainHeaders_subscribe();
+      const header = await client.blockchainHeaders_subscribe();
       if (header && header.height) {
         latestBlock = {
           height: header.height,
           time: Math.floor(+new Date() / 1000),
         };
       }
-      // AsyncStorage.setItem(storageKey, JSON.stringify(peers));  TODO: refactor
+      return { ok: true, peer: usingPeer };
     }
+    return { ok: false, peer: usingPeer };
   } catch (e) {
-    mainConnected = false;
-    console.log('bad connection:', JSON.stringify(usingPeer), e);
-    mainClient?.close();
-    mainClient = undefined;
+    console.log('[electrum] bad connection:', JSON.stringify(usingPeer), e);
+    if (mainClient) {
+      try {
+        mainClient.close();
+      } catch {}
+      mainClient = undefined;
+    }
+    return { ok: false, peer: usingPeer };
+  }
+}
+
+/** Single liveness check on the current `mainClient`, bounded by `PING_TIMEOUT_MS`. */
+async function pingWithTimeout(timeoutMs: number = PING_TIMEOUT_MS): Promise<boolean> {
+  if (!mainClient) return false;
+  const client = mainClient;
+  try {
+    await Promise.race([
+      client.server_ping(),
+      new Promise<never>((_resolve, reject) => setTimeout(() => reject(new Error('ping timeout')), timeoutMs)),
+    ]);
+    return mainClient === client; // server replied AND client wasn't swapped while we waited
+  } catch {
+    return false;
+  }
+}
+
+export type EnsureConnectedOptions = {
+  /**
+   * Show the legacy "couldn't connect" alert (Try again / Reset / Cancel) on failure.
+   * Used by initial bootstrap (`SettingsProvider` re-enabling Electrum) and the manual
+   * help alert. Off-hot-path callers (refresh, broadcast, etc.) should leave this false
+   * and surface their own UI.
+   */
+  showAlertOnFailure?: boolean;
+};
+
+/**
+ * Make sure a usable Electrum connection exists, healing if needed.
+ *
+ *   - If we already think we're connected, run one fast `ping` to verify. If the ping
+ *     succeeds, we're done. If it fails the client is torn down and we fall through
+ *     to a reconnect.
+ *   - Otherwise run up to `CONNECT_MAX_ATTEMPTS` connect attempts (each with its own
+ *     timeout + backoff).
+ *
+ * Concurrent callers share the same in-flight promise — there is at most one connect
+ * attempt at a time per process. This replaces the old `mainConnected`-flag-polling
+ * `waitTillConnected()`, which could block ~30s on a stale flag while the socket was
+ * still alive.
+ */
+export async function ensureConnected(opts: EnsureConnectedOptions = {}): Promise<boolean> {
+  const { showAlertOnFailure = false } = opts;
+
+  if (await isDisabled()) {
+    setConnectionState('disabled');
+    return false;
   }
 
-  if (!mainConnected) {
-    console.log('retry');
-    connectionAttempt = connectionAttempt + 1;
-    mainClient?.close();
-    mainClient = undefined;
-    if (connectionAttempt >= 5) {
-      presentNetworkErrorAlert(usingPeer);
-    } else {
-      console.log('reconnection attempt #', connectionAttempt);
-      await new Promise(resolve => setTimeout(resolve, 500)); // sleep
-      return connectMain();
-    }
+  if (ensureInFlight) {
+    if (showAlertOnFailure) ensureInFlightShowAlert = true;
+    return ensureInFlight;
   }
+
+  ensureInFlightShowAlert = showAlertOnFailure;
+  ensureInFlight = (async (): Promise<boolean> => {
+    const myGeneration = disconnectGeneration;
+    /** True iff the current generation no longer matches ours (i.e. `forceDisconnect()` ran). */
+    const aborted = (where: string): boolean => {
+      if (myGeneration === disconnectGeneration) return false;
+      console.log(`[electrum] ensureConnected aborted by forceDisconnect at ${where} (gen ${myGeneration} → ${disconnectGeneration})`);
+      return true;
+    };
+    let lastPeer: Peer | undefined;
+    try {
+      // Fast path: live ping on the existing client.
+      if (mainClient && connState === 'connected') {
+        if (await pingWithTimeout()) {
+          // If a disconnect/disable raced us, the bumper already set the right
+          // state ('disconnected' or 'disabled'); don't clobber it from here.
+          if (aborted('post-ping')) return false;
+          return true;
+        }
+        // Stale socket. Tear it down so the attempt loop starts fresh.
+        try {
+          mainClient.close();
+        } catch {}
+        mainClient = undefined;
+        setConnectionState('disconnected');
+      }
+
+      if (aborted('pre-loop')) return false;
+      setConnectionState('connecting');
+
+      for (let i = 0; i < CONNECT_MAX_ATTEMPTS; i++) {
+        if (await isDisabled()) {
+          setConnectionState('disabled');
+          return false;
+        }
+        // Generation-bumper (`forceDisconnect` or `setDisabled(true)`) already
+        // set the appropriate terminal state; we must not clobber 'disabled'
+        // back to 'disconnected' here.
+        if (aborted(`attempt ${i} start`)) return false;
+
+        const { ok, peer } = await attemptConnectOnce();
+        lastPeer = peer;
+
+        if (aborted(`attempt ${i} end`)) {
+          if (mainClient) {
+            try {
+              mainClient.close();
+            } catch {}
+            mainClient = undefined;
+          }
+          return false;
+        }
+        if (ok) {
+          setConnectionState('connected');
+          return true;
+        }
+        if (i < CONNECT_MAX_ATTEMPTS - 1) {
+          await new Promise(resolve => setTimeout(resolve, CONNECT_BACKOFF_MS));
+        }
+      }
+
+      setConnectionState('disconnected');
+      if (ensureInFlightShowAlert) {
+        // Wait until the async disabled-preference check has completed and the alert has actually
+        // been presented. Coalesced refresh callers may need to register dismissal work before
+        // this ensureConnected() promise resolves.
+        // eslint-disable-next-line @typescript-eslint/no-use-before-define -- defined later in file
+        await presentNetworkErrorAlert(lastPeer);
+      }
+      return false;
+    } finally {
+      ensureInFlight = null;
+      ensureInFlightShowAlert = false;
+    }
+  })();
+
+  return ensureInFlight;
 }
 
 export async function presentResetToDefaultsAlert(): Promise<boolean> {
@@ -358,7 +592,7 @@ export async function presentResetToDefaultsAlert(): Promise<boolean> {
             await DefaultPreference.clear(ELECTRUM_SSL_PORT);
             await DefaultPreference.clear(ELECTRUM_TCP_PORT);
           } catch (e) {
-            console.log(e); // Must be running on Android
+            console.log('[electrum]', e); // Must be running on Android
           }
           resolve(true);
         },
@@ -377,7 +611,7 @@ export async function presentResetToDefaultsAlert(): Promise<boolean> {
             await DefaultPreference.clear(ELECTRUM_SSL_PORT);
             await DefaultPreference.clear(ELECTRUM_TCP_PORT);
           } catch (e) {
-            console.log(e); // Must be running on Android
+            console.log('[electrum]', e); // Must be running on Android
           }
           resolve(true);
         },
@@ -400,16 +634,16 @@ export async function presentResetToDefaultsAlert(): Promise<boolean> {
   });
 }
 
-const presentNetworkErrorAlert = async (usingPeer?: Peer) => {
+async function presentNetworkErrorAlert(usingPeer?: Peer, allowRepeat = false) {
   if (await isDisabled()) {
     console.log(
-      'Electrum connection disabled by user. Perhaps we are attempting to show this network error alert after the user disabled connections.',
+      '[electrum] Electrum connection disabled by user. Perhaps we are attempting to show this network error alert after the user disabled connections.',
     );
     return;
   }
 
-  presentAlert({
-    allowRepeat: false,
+  await presentAlert({
+    allowRepeat,
     title: loc.errors.network,
     message: loc.formatString(
       usingPeer ? loc.settings.electrum_unable_to_connect : loc.settings.electrum_error_connect,
@@ -419,10 +653,10 @@ const presentNetworkErrorAlert = async (usingPeer?: Peer) => {
       {
         text: loc.wallets.list_tryagain,
         onPress: () => {
-          connectionAttempt = 0;
-          mainClient?.close();
-          mainClient = undefined;
-          setTimeout(connectMain, 500);
+          forceDisconnect();
+          setTimeout(() => {
+            ensureConnected({ showAlertOnFailure: true }).catch(() => {});
+          }, 500);
         },
         style: 'default',
       },
@@ -436,16 +670,21 @@ const presentNetworkErrorAlert = async (usingPeer?: Peer) => {
       {
         text: loc._.cancel,
         onPress: () => {
-          connectionAttempt = 0;
-          mainClient?.close();
-          mainClient = undefined;
+          forceDisconnect();
         },
         style: 'cancel',
       },
     ],
     options: { cancelable: false },
   });
-};
+}
+
+/**
+ * Wallets list header when Electrum looks disconnected: same actions as the internal timeout alert, with allowRepeat so the user can open it again after dismiss.
+ */
+export async function presentElectrumDisconnectedHelpAlert(): Promise<void> {
+  await presentNetworkErrorAlert(undefined, true);
+}
 
 /**
  * Returns random electrum server out of list of servers
@@ -492,18 +731,27 @@ export const getBalanceByAddress = async function (address: string): Promise<{ c
     balance.addr = address;
     return balance;
   } catch (error) {
-    console.error('Error in getBalanceByAddress:', error);
+    console.error('[electrum] Error in getBalanceByAddress:', error);
     throw error;
   }
 };
 
 export const getConfig = async function () {
-  if (!mainClient) throw new Error('Electrum client is not connected');
+  if (!mainClient) {
+    return {
+      host: undefined,
+      port: undefined,
+      serverName: false as typeof serverName,
+      connected: connState === 'connected' ? 1 : 0,
+    };
+  }
   return {
     host: mainClient.host,
     port: mainClient.port,
     serverName,
-    connected: mainClient.timeLastCall !== 0 && mainClient.status,
+    // Drive UI "connected" indicator from the single state machine so the settings
+    // screen agrees with the wallets-list header pill and with `ensureConnected()`.
+    connected: connState === 'connected' ? 1 : 0,
   };
 };
 
@@ -532,14 +780,24 @@ export const getMempoolTransactionsByAddress = async function (address: string):
   return mainClient.blockchainScripthash_getMempool(uint8ArrayToHex(reversedHash));
 };
 
-export const ping = async function () {
-  try {
-    await mainClient.server_ping();
-    return true;
-  } catch (_) {}
-
-  mainConnected = false;
-  return false;
+/**
+ * Read-only liveness probe. Does NOT trigger reconnects (use `ensureConnected()`
+ * for that). Updates the connection state machine to reflect the probe result so
+ * subscribers (UI pill, settings screen) stay in sync.
+ *
+ * - `true`: server replied within `PING_TIMEOUT_MS`.
+ * - `false`: client missing, timed out, or server errored.
+ */
+export const ping = async function (): Promise<boolean> {
+  if (await isDisabled()) return false;
+  const ok = await pingWithTimeout();
+  if (ok) {
+    // Heal stale `disconnected` state from a transient ping failure earlier.
+    if (connState !== 'connected') setConnectionState('connected');
+  } else if (connState === 'connected') {
+    setConnectionState('disconnected');
+  }
+  return ok;
 };
 
 // exported only to be used in unit tests
@@ -594,6 +852,21 @@ export function txhexToElectrumTransaction(txhex: string): ElectrumTransactionWi
     let address: false | string = false;
     let type: false | string = false;
 
+    // Lazy require to avoid the module-scope cycle described above. These
+    // modules are fully loaded by the time this function is actually invoked.
+    const { SegwitBech32Wallet } = require('../class/wallets/segwit-bech32-wallet') as {
+      SegwitBech32Wallet: typeof SegwitBech32WalletT;
+    };
+    const { SegwitP2SHWallet } = require('../class/wallets/segwit-p2sh-wallet') as {
+      SegwitP2SHWallet: typeof SegwitP2SHWalletT;
+    };
+    const { LegacyWallet } = require('../class/wallets/legacy-wallet') as {
+      LegacyWallet: typeof LegacyWalletT;
+    };
+    const { TaprootWallet } = require('../class/wallets/taproot-wallet') as {
+      TaprootWallet: typeof TaprootWalletT;
+    };
+
     if (SegwitBech32Wallet.scriptPubKeyToAddress(uint8ArrayToHex(out.script))) {
       address = SegwitBech32Wallet.scriptPubKeyToAddress(uint8ArrayToHex(out.script));
       type = 'witness_v0_keyhash';
@@ -627,71 +900,6 @@ export function txhexToElectrumTransaction(txhex: string): ElectrumTransactionWi
   }
   return ret;
 }
-
-export const getTransactionsFullByAddress = async (address: string): Promise<ElectrumTransaction[]> => {
-  const txs = await getTransactionsByAddress(address);
-  const ret: ElectrumTransaction[] = [];
-  for (const tx of txs) {
-    let full;
-    try {
-      full = await mainClient.blockchainTransaction_get(tx.tx_hash, true);
-    } catch (error: any) {
-      if (String(error?.message ?? error).startsWith('verbose transactions are currently unsupported')) {
-        // apparently, stupid esplora instead of returning txhex when it cant return verbose tx started
-        // throwing a proper exception. lets fetch txhex manually and decode on our end
-        const txhex = await mainClient.blockchainTransaction_get(tx.tx_hash, false);
-        full = txhexToElectrumTransaction(txhex);
-      } else {
-        // nope, its something else
-        throw new Error(String(error?.message ?? error));
-      }
-    }
-    full.address = address;
-    for (const input of full.vin) {
-      // now we need to fetch previous TX where this VIN became an output, so we can see its amount
-      let prevTxForVin;
-      try {
-        prevTxForVin = await mainClient.blockchainTransaction_get(input.txid, true);
-      } catch (error: any) {
-        if (String(error?.message ?? error).startsWith('verbose transactions are currently unsupported')) {
-          // apparently, stupid esplora instead of returning txhex when it cant return verbose tx started
-          // throwing a proper exception. lets fetch txhex manually and decode on our end
-          const txhex = await mainClient.blockchainTransaction_get(input.txid, false);
-          prevTxForVin = txhexToElectrumTransaction(txhex);
-        } else {
-          // nope, its something else
-          throw new Error(String(error?.message ?? error));
-        }
-      }
-      if (prevTxForVin && prevTxForVin.vout && prevTxForVin.vout[input.vout]) {
-        input.value = prevTxForVin.vout[input.vout].value;
-        // also, we extract destination address from prev output:
-        if (prevTxForVin.vout[input.vout].scriptPubKey && prevTxForVin.vout[input.vout].scriptPubKey.addresses) {
-          input.addresses = prevTxForVin.vout[input.vout].scriptPubKey.addresses;
-        }
-        // in bitcoin core 22.0.0+ they removed `.addresses` and replaced it with plain `.address`:
-        if (prevTxForVin.vout[input.vout]?.scriptPubKey?.address) {
-          input.addresses = [prevTxForVin.vout[input.vout].scriptPubKey.address];
-        }
-      }
-    }
-
-    for (const output of full.vout) {
-      if (output?.scriptPubKey && output.scriptPubKey.addresses) output.addresses = output.scriptPubKey.addresses;
-      // in bitcoin core 22.0.0+ they removed `.addresses` and replaced it with plain `.address`:
-      if (output?.scriptPubKey?.address) output.addresses = [output.scriptPubKey.address];
-    }
-    full.inputs = full.vin;
-    full.outputs = full.vout;
-    delete full.vin;
-    delete full.vout;
-    delete full.hex; // compact
-    delete full.hash; // compact
-    ret.push(full);
-  }
-
-  return ret;
-};
 
 type MultiGetBalanceResponse = {
   balance: number;
@@ -737,7 +945,7 @@ export const multiGetBalanceByAddress = async (addresses: string[], batchsize: n
     }
 
     for (const bal of balances) {
-      if (bal.error) console.warn('multiGetBalanceByAddress():', bal.error);
+      if (bal.error) console.warn('[electrum] multiGetBalanceByAddress():', bal.error);
       ret.balance += +bal.result.confirmed;
       ret.unconfirmed_balance += +bal.result.unconfirmed;
       ret.addresses[scripthash2addr[bal.param]] = bal.result;
@@ -747,9 +955,17 @@ export const multiGetBalanceByAddress = async (addresses: string[], batchsize: n
   return ret;
 };
 
+/** raw row of blockchain.scripthash.listunspent */
+type ElectrumUnspent = {
+  tx_hash: string;
+  tx_pos: number;
+  height: number;
+  value: number;
+};
+
 export const multiGetUtxoByAddress = async function (addresses: string[], batchsize: number = 100): Promise<Record<string, Utxo[]>> {
   if (!mainClient) throw new Error('Electrum client is not connected');
-  const ret: Record<string, any> = {};
+  const ret: Record<string, Utxo[]> = {};
 
   const chunks = splitIntoChunks(addresses, batchsize);
   for (const chunk of chunks) {
@@ -763,7 +979,7 @@ export const multiGetUtxoByAddress = async function (addresses: string[], batchs
       scripthash2addr[reversedHash] = addr;
     }
 
-    let results = [];
+    let results: { param: string; result: ElectrumUnspent[] }[] = [];
 
     if (disableBatching) {
       // ElectrumPersonalServer doesnt support `blockchain.scripthash.listunspent`
@@ -774,14 +990,14 @@ export const multiGetUtxoByAddress = async function (addresses: string[], batchs
     }
 
     for (const utxos of results) {
-      ret[scripthash2addr[utxos.param]] = utxos.result;
-      for (const utxo of ret[scripthash2addr[utxos.param]]) {
-        utxo.address = scripthash2addr[utxos.param];
-        utxo.txid = utxo.tx_hash;
-        utxo.vout = utxo.tx_pos;
-        delete utxo.tx_pos;
-        delete utxo.tx_hash;
-      }
+      const address = scripthash2addr[utxos.param];
+      ret[address] = utxos.result.map(u => ({
+        address,
+        txid: u.tx_hash,
+        vout: u.tx_pos,
+        height: u.height,
+        value: u.value,
+      }));
     }
   }
 
@@ -831,7 +1047,7 @@ export const multiGetHistoryByAddress = async function (
     }
 
     for (const history of results) {
-      if (history.error) console.warn('multiGetHistoryByAddress():', history.error);
+      if (history.error) console.warn('[electrum] multiGetHistoryByAddress():', history.error);
       ret[scripthash2addr[history.param]] = history.result || [];
       for (const result of history.result || []) {
         if (result.tx_hash) txhashHeightCache[result.tx_hash] = result.height; // cache tx height
@@ -867,12 +1083,12 @@ export async function multiGetTransactionByTxid<T extends boolean>(
   const cacheKeySuffix = verbose ? '_verbose' : '_non_verbose';
   const keysCacheMiss = [];
   for (const txid of txids) {
-    const jsonString = realm.objectForPrimaryKey('Cache', txid + cacheKeySuffix); // search for a realm object with a primary key
+    const jsonString = realm.objectForPrimaryKey<TCacheRow>('Cache', txid + cacheKeySuffix); // search for a realm object with a primary key
     if (jsonString && jsonString.cache_value) {
       try {
-        ret[txid] = JSON.parse(jsonString.cache_value as string);
+        ret[txid] = JSON.parse(jsonString.cache_value);
       } catch (error) {
-        console.log(error, 'cache failed to parse', jsonString.cache_value);
+        console.log('[electrum]', error, 'cache failed to parse', jsonString.cache_value);
       }
     }
 
@@ -913,8 +1129,8 @@ export async function multiGetTransactionByTxid<T extends boolean>(
           const txid = index2txid[resultIndex];
           results.push({ result: tx, param: txid });
         }
-      } catch (error: any) {
-        if (String(error?.message ?? error).startsWith('verbose transactions are currently unsupported')) {
+      } catch (error) {
+        if (errorMessage(error).startsWith('verbose transactions are currently unsupported')) {
           // electrs-esplora. cant use verbose, so fetching txs one by one and decoding locally
           for (const txid of chunk) {
             try {
@@ -922,7 +1138,7 @@ export async function multiGetTransactionByTxid<T extends boolean>(
               tx = txhexToElectrumTransaction(tx);
               results.push({ result: tx, param: txid });
             } catch (err) {
-              console.log(err);
+              console.log('[electrum]', err);
             }
           }
         } else {
@@ -938,7 +1154,7 @@ export async function multiGetTransactionByTxid<T extends boolean>(
               }
               results.push({ result: tx, param: txid });
             } catch (err) {
-              console.log(err);
+              console.log('[electrum]', err);
             }
           }
         }
@@ -952,12 +1168,12 @@ export async function multiGetTransactionByTxid<T extends boolean>(
         // response too large
         // lets do single call, that should go through okay:
         txdata.result = await mainClient.blockchainTransaction_get(txdata.param, false);
-        // since we used VERBOSE=false, server sent us plain txhex which we must decode on our end:
-        txdata.result = txhexToElectrumTransaction(txdata.result);
+        // since we used VERBOSE=false, server sent us plain txhex which we must decode on our end (if caller asked for it):
+        if (verbose) txdata.result = txhexToElectrumTransaction(txdata.result);
       }
       ret[txdata.param] = txdata.result;
-      // @ts-ignore: hex property
-      if (ret[txdata.param]) delete ret[txdata.param].hex; // compact
+      const tx: Partial<ElectrumTransactionWithHex> | string | undefined = ret[txdata.param];
+      if (tx && typeof tx !== 'string') delete tx.hex; // compact
     }
   }
 
@@ -966,7 +1182,6 @@ export async function multiGetTransactionByTxid<T extends boolean>(
     const tx = ret[txid];
     if (typeof tx === 'string') continue;
     for (const vout of tx?.vout ?? []) {
-      // @ts-ignore: address is not in type definition
       if (vout?.scriptPubKey?.address) vout.scriptPubKey.addresses = [vout.scriptPubKey.address];
     }
   }
@@ -987,46 +1202,35 @@ export async function multiGetTransactionByTxid<T extends boolean>(
           {
             cache_key: txid + cacheKeySuffix,
             cache_value: JSON.stringify(ret[txid]),
-          },
+          } satisfies TCacheRow,
           Realm.UpdateMode.Modified,
         );
       }
     });
   } catch (writeError) {
-    console.error('Failed to write transaction cache:', writeError);
+    console.error('[electrum] Failed to write transaction cache:', writeError);
   }
 
   return ret;
 }
 
 /**
- * Simple waiter till `mainConnected` becomes true (which means
- * it Electrum was connected in other function), or timeout 30 sec.
+ * Removes cached raw txhexes (non-verbose) of these txids, so next time they are fetched from the server. Used when a
+ * cached copy fails verification (e.g. it was saved while connected to a malicious server)
  */
-export const waitTillConnected = async function (): Promise<boolean> {
-  let waitTillConnectedInterval: NodeJS.Timeout | undefined;
-  let retriesCounter = 0;
-  if (await isDisabled()) {
-    console.warn('Electrum connections disabled by user. waitTillConnected skipping...');
-    return false;
+export async function forgetCachedTransactions(txids: string[]) {
+  try {
+    const realm = await _getRealm();
+    realm.write(() => {
+      for (const txid of txids) {
+        const cached = realm.objectForPrimaryKey('Cache', txid + '_non_verbose');
+        if (cached) realm.delete(cached);
+      }
+    });
+  } catch (writeError) {
+    console.error('[electrum] Failed to forget transaction cache:', writeError);
   }
-  return new Promise(function (resolve, reject) {
-    waitTillConnectedInterval = setInterval(() => {
-      if (mainConnected) {
-        clearInterval(waitTillConnectedInterval);
-        return resolve(true);
-      }
-
-      if (wasConnectedAtLeastOnce && retriesCounter++ >= 150) {
-        // `wasConnectedAtLeastOnce` needed otherwise theres gona be a race condition with the code that connects
-        // electrum during app startup
-        clearInterval(waitTillConnectedInterval);
-        presentNetworkErrorAlert();
-        reject(new Error('Waiting for Electrum connection timeout'));
-      }
-    }, 100);
-  });
-};
+}
 
 // Returns the value at a given percentile in a sorted numeric array.
 // "Linear interpolation between closest ranks" method
@@ -1126,7 +1330,7 @@ export const estimateFee = async function (numberOfBlocks: number): Promise<numb
   numberOfBlocks = numberOfBlocks || 1;
   const coinUnitsPerKilobyte = await mainClient.blockchainEstimatefee(numberOfBlocks);
   if (coinUnitsPerKilobyte === -1) return 1;
-  return Math.round(new BigNumber(coinUnitsPerKilobyte).dividedBy(1024).multipliedBy(100000000).toNumber());
+  return Math.ceil(new BigNumber(coinUnitsPerKilobyte).dividedBy(1024).multipliedBy(100000000).toNumber());
 };
 
 export const serverFeatures = async function () {
@@ -1146,7 +1350,12 @@ export const broadcast = async function (hex: string) {
 
 export const broadcastV2 = async function (hex: string): Promise<string> {
   if (!mainClient) throw new Error('Electrum client is not connected');
-  return mainClient.blockchainTransaction_broadcast(hex);
+  try {
+    return await mainClient.blockchainTransaction_broadcast(hex);
+  } catch (error) {
+    // electrum-client rejects JSON-RPC errors as `{ code, message }`, not Error
+    throw new Error(errorMessage(error) || String(error));
+  }
 };
 
 export const estimateCurrentBlockheight = function (): number {
@@ -1179,10 +1388,11 @@ export const testConnection = async function (host: string, tcpPort?: number, ss
 
   client.onError = () => {}; // mute
   let timeoutId: NodeJS.Timeout | undefined;
+  const timeoutMs = host.endsWith('.onion') ? 21_000 : 5_000;
   try {
     const rez = await Promise.race([
       new Promise(resolve => {
-        timeoutId = setTimeout(() => resolve('timeout'), 5000);
+        timeoutId = setTimeout(() => resolve('timeout'), timeoutMs);
       }),
       client.connect(),
     ]);
@@ -1200,8 +1410,19 @@ export const testConnection = async function (host: string, tcpPort?: number, ss
   return false;
 };
 
+/**
+ * Drop the current connection and tell any in-flight `ensureConnected()` to abort
+ * (so it doesn't race the disconnect by setting state back to `connected`).
+ */
 export const forceDisconnect = (): void => {
-  mainClient?.close();
+  disconnectGeneration += 1;
+  if (mainClient) {
+    try {
+      mainClient.close();
+    } catch {}
+    mainClient = undefined;
+  }
+  setConnectionState('disconnected');
 };
 
 export const setBatchingDisabled = () => {
@@ -1216,8 +1437,139 @@ export function getServerBanner(): Promise<string> {
   return mainClient.request('server.banner', []);
 }
 
-const splitIntoChunks = function (arr: any[], chunkSize: number) {
-  const groups = [];
+/** Seconds before `getCurrentBlockTip()` re-requests the header from the server. */
+const TIP_CACHE_TTL_SEC = 60;
+
+/** Max blocks a cached tx height may lead the tip before we treat the cache entry as poisoned. */
+const MAX_CACHE_AHEAD_OF_TIP = 6;
+
+async function fetchBlockTipFromServer(): Promise<number | null> {
+  if (!mainClient) {
+    return latestBlock.height ?? null;
+  }
+
+  const now = Math.floor(+new Date() / 1000);
+  try {
+    const header = await mainClient.blockchainHeaders_subscribe();
+    if (header && header.height) {
+      latestBlock = { height: header.height, time: now };
+      return header.height;
+    }
+  } catch (e) {
+    console.warn('getCurrentBlockTip: subscribe failed', e);
+  }
+
+  return latestBlock.height ?? null;
+}
+
+export async function getCurrentBlockTip(): Promise<number> {
+  const now = Math.floor(+new Date() / 1000);
+  if (latestBlock.height && now - latestBlock.time < TIP_CACHE_TTL_SEC) {
+    return latestBlock.height;
+  }
+
+  if (!mainClient) {
+    if (latestBlock.height) return latestBlock.height;
+    throw new Error('Electrum client is not connected');
+  }
+
+  const refreshed = await fetchBlockTipFromServer();
+  if (refreshed) return refreshed;
+  return estimateCurrentBlockheight();
+}
+
+export type ConfirmedBlockInfo = { height: number; tip: number };
+
+/**
+ * Returns the confirmed block height and current tip for a given txHash.
+ * Both values share the same tip source so callers never mix an estimated tip with a real height.
+ * 1. Tries the in-memory txhashHeightCache (populated from address history).
+ * 2. Falls back to a DIRECT server call (bypassing Realm cache) to get fresh confirmations.
+ *    Uses standard Bitcoin convention: height = tip - confirmations + 1.
+ */
+export async function getConfirmedBlockHeight(txHash: string): Promise<ConfirmedBlockInfo | null> {
+  let tip = await getCurrentBlockTip();
+
+  const cached = txhashHeightCache[txHash];
+  if (cached && cached > 0) {
+    if (cached <= tip) {
+      return { height: cached, tip };
+    }
+
+    // Cached height ahead of tip: refresh tip (TTL may be stale), then re-validate.
+    const refreshedTip = await fetchBlockTipFromServer();
+    if (refreshedTip != null) {
+      tip = refreshedTip;
+    }
+    if (cached <= tip) {
+      return { height: cached, tip };
+    }
+
+    const aheadBy = cached - tip;
+    if (aheadBy <= MAX_CACHE_AHEAD_OF_TIP) {
+      // Address-history height is trustworthy; our tip is just lagging.
+      return { height: cached, tip };
+    }
+
+    delete txhashHeightCache[txHash];
+  }
+
+  if (!mainClient) return null;
+
+  try {
+    const verboseTx = await mainClient.blockchainTransaction_get(txHash, true);
+
+    if (typeof verboseTx === 'string') {
+      // Server didn't support verbose — decode locally.
+      // Without txhashHeightCache entry we can't determine height.
+      return null;
+    }
+
+    const confirmations = Number(verboseTx?.confirmations);
+    if (!confirmations || confirmations <= 0) return null;
+
+    const height = tip - confirmations + 1;
+    if (height <= 0 || height > tip) {
+      return null;
+    }
+    txhashHeightCache[txHash] = height;
+    return { height, tip };
+  } catch (e) {
+    console.warn('getConfirmedBlockHeight: failed', e);
+    return null;
+  }
+}
+
+/**
+ * Fetches actual block header timestamps from the Electrum server for the given heights.
+ * Parses the 80-byte hex-encoded header to extract the 4-byte LE timestamp at byte offset 68.
+ */
+export async function getBlockTimestamps(heights: number[]): Promise<Record<number, number>> {
+  if (!mainClient) throw new Error('Electrum client is not connected');
+  const result: Record<number, number> = {};
+  const promises = heights.map(async height => {
+    try {
+      const headerHex: string = await mainClient.blockchainBlock_header(height);
+      // timestamp is at bytes 68–71 of the 80-byte header (hex chars 136–143), little-endian uint32
+      const tsHex = headerHex.slice(136, 144);
+      /* eslint-disable no-bitwise */
+      const timestamp =
+        parseInt(tsHex.slice(0, 2), 16) |
+        (parseInt(tsHex.slice(2, 4), 16) << 8) |
+        (parseInt(tsHex.slice(4, 6), 16) << 16) |
+        ((parseInt(tsHex.slice(6, 8), 16) << 24) >>> 0);
+      /* eslint-enable no-bitwise */
+      result[height] = timestamp;
+    } catch (e) {
+      console.warn(`Failed to fetch block header for height ${height}:`, e);
+    }
+  });
+  await Promise.all(promises);
+  return result;
+}
+
+const splitIntoChunks = function <T>(arr: T[], chunkSize: number): T[][] {
+  const groups: T[][] = [];
   let i;
   for (i = 0; i < arr.length; i += chunkSize) {
     groups.push(arr.slice(i, i + chunkSize));

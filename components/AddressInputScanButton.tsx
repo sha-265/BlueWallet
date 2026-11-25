@@ -6,7 +6,7 @@ import loc from '../loc';
 import { showFilePickerAndReadFile, showImagePickerAndReadImage } from '../blue_modules/fs';
 import presentAlert from './Alert';
 import { useTheme } from './themes';
-import RNQRGenerator from 'rn-qr-generator';
+import { detectQRCodeInImage } from 'react-native-camera-kit-no-google';
 import { CommonToolTipActions } from '../typings/CommonToolTipActions';
 import { useSettings } from '../hooks/context/useSettings';
 import { scanQrHelper } from '../helpers/scan-qr.ts';
@@ -14,7 +14,8 @@ import { scanQrHelper } from '../helpers/scan-qr.ts';
 interface AddressInputScanButtonProps {
   isLoading?: boolean;
   onChangeText: (text: string) => void;
-  type?: 'default' | 'link';
+  onPasteFromClipboard?: (text: string) => void;
+  type?: 'default' | 'link' | 'compact';
   testID?: string;
   beforePress?: () => Promise<void> | void;
 }
@@ -22,6 +23,7 @@ interface AddressInputScanButtonProps {
 export const AddressInputScanButton = ({
   isLoading,
   onChangeText,
+  onPasteFromClipboard,
   type = 'default',
   testID = 'BlueAddressInputScanQrButton',
   beforePress,
@@ -79,12 +81,9 @@ export const AddressInputScanButton = ({
             if (getImage) {
               try {
                 const base64Data = getImage.replace(/^data:image\/(png|jpeg|jpg);base64,/, '');
-                const values = await RNQRGenerator.detect({
-                  base64: base64Data,
-                });
-
-                if (values && values.values.length > 0) {
-                  onChangeText(values.values[0]);
+                const result = await detectQRCodeInImage(base64Data);
+                if (result) {
+                  onChangeText(result);
                 } else {
                   presentAlert({ message: loc.send.qr_error_no_qrcode });
                 }
@@ -93,7 +92,11 @@ export const AddressInputScanButton = ({
               }
             } else {
               const clipboardText = await Clipboard.getString();
-              onChangeText(clipboardText);
+              if (onPasteFromClipboard) {
+                onPasteFromClipboard(clipboardText);
+              } else {
+                onChangeText(clipboardText);
+              }
             }
           } catch (error) {
             presentAlert({ message: (error as Error).message });
@@ -124,10 +127,18 @@ export const AddressInputScanButton = ({
       }
       Keyboard.dismiss();
     },
-    [onChangeText],
+    [onChangeText, onPasteFromClipboard],
   );
 
-  const menuButtonStyle = useMemo(() => (type === 'default' ? [styles.scan, stylesHook.scan] : undefined), [stylesHook.scan, type]);
+  const menuButtonStyle = useMemo(() => {
+    if (type === 'default') {
+      return [styles.scan, stylesHook.scan];
+    }
+    if (type === 'compact') {
+      return [styles.compact, stylesHook.scan];
+    }
+    return undefined;
+  }, [stylesHook.scan, type]);
 
   return (
     <ToolTipMenu
@@ -137,8 +148,9 @@ export const AddressInputScanButton = ({
       shouldOpenOnLongPress
       disabled={isLoading}
       onPress={toolTipOnPress}
-      testID={type === 'default' ? testID : undefined}
+      testID={type === 'default' || type === 'compact' ? testID : undefined}
       buttonStyle={menuButtonStyle}
+      style={type === 'compact' ? styles.compactWrapper : type === 'link' ? styles.linkWrapper : undefined}
       accessibilityLabel={loc.send.details_scan}
       accessibilityHint={loc.send.details_scan_hint}
     >
@@ -146,6 +158,12 @@ export const AddressInputScanButton = ({
         <View style={styles.scanContent}>
           <Image source={require('../img/scan-white.png')} accessible={false} />
           <Text numberOfLines={1} style={[styles.scanText, stylesHook.scanText]} accessible={false}>
+            {loc.send.details_scan}
+          </Text>
+        </View>
+      ) : type === 'compact' ? (
+        <View style={styles.compactContent}>
+          <Text numberOfLines={1} style={[styles.compactText, stylesHook.scanText]} accessible={false}>
             {loc.send.details_scan}
           </Text>
         </View>
@@ -177,6 +195,35 @@ const styles = StyleSheet.create({
     marginHorizontal: 4,
     alignSelf: 'center',
   },
+  compact: {
+    height: 28,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexGrow: 0,
+    flexShrink: 0,
+    borderRadius: 4,
+    paddingVertical: 2,
+    paddingHorizontal: 8,
+    marginHorizontal: 2,
+    alignSelf: 'center',
+  },
+  compactWrapper: {
+    flexGrow: 0,
+    flexShrink: 0,
+  },
+  compactContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    flexShrink: 0,
+  },
+  compactText: {
+    fontSize: 13,
+    flexShrink: 0,
+    textAlign: 'center',
+    textAlignVertical: 'center',
+  },
   scanText: {
     marginLeft: 4,
     flexShrink: 0,
@@ -188,6 +235,9 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     flexShrink: 0,
   },
+  linkWrapper: {
+    alignSelf: 'center',
+  },
   linkText: {
     textAlign: 'center',
     fontSize: 16,
@@ -198,6 +248,6 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'center',
-    width: '100%',
+    alignSelf: 'center',
   },
 });

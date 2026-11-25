@@ -1,11 +1,11 @@
 import { CipherSeed } from 'aezeed';
 import BIP32Factory from 'bip32';
 import * as bitcoin from 'bitcoinjs-lib';
-import b58 from 'bs58check';
 
 import ecc from '../../blue_modules/noble_ecc';
-import { concatUint8Arrays, hexToUint8Array, uint8ArrayToHex } from '../../blue_modules/uint8array-extras';
+import { hexToUint8Array, uint8ArrayToHex } from '../../blue_modules/uint8array-extras';
 import { AbstractHDElectrumWallet } from './abstract-hd-electrum-wallet';
+import { errorMessage } from '../../helpers/errorMessage';
 
 const bip32 = BIP32Factory(ecc);
 
@@ -26,7 +26,6 @@ export class HDAezeedWallet extends AbstractHDElectrumWallet {
   static readonly derivationPath = "m/84'/0'/0'";
   // @ts-ignore: override
   public readonly type = HDAezeedWallet.type;
-  // @ts-ignore: override
   public readonly typeReadable = HDAezeedWallet.typeReadable;
 
   private _entropyHex?: string;
@@ -55,10 +54,7 @@ export class HDAezeedWallet extends AbstractHDElectrumWallet {
     const xpub = child.toBase58();
 
     // bitcoinjs does not support zpub yet, so we just convert it from xpub
-    let data = b58.decode(xpub);
-    data = data.slice(4);
-    const concatenated = concatUint8Arrays([hexToUint8Array('04b24746'), data]);
-    this._xpub = b58.encode(concatenated);
+    this._xpub = this._xpubToZpub(xpub);
 
     return this._xpub;
   }
@@ -83,8 +79,8 @@ export class HDAezeedWallet extends AbstractHDElectrumWallet {
     try {
       const cipherSeed1 = await CipherSeed.fromMnemonic(this.secret, passphrase);
       this._entropyHex = cipherSeed1.entropy.toString('hex'); // save cache
-    } catch (error: any) {
-      return error.message === 'Invalid Password';
+    } catch (error) {
+      return errorMessage(error) === 'Invalid Password';
     }
     return false;
   }
@@ -135,6 +131,10 @@ export class HDAezeedWallet extends AbstractHDElectrumWallet {
     }
 
     return (this.external_addresses_cache[index] = address);
+  }
+
+  _getBip32Root() {
+    return bip32.fromSeed(this._getEntropyCached());
   }
 
   _getWIFByIndex(internal: boolean, index: number): string | false {

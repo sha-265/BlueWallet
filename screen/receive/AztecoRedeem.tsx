@@ -1,9 +1,9 @@
-import { RouteProp, useRoute } from '@react-navigation/native';
+import { useNavigation, RouteProp, useRoute } from '@react-navigation/native';
 import Icon from '../../components/Icon';
 import React, { useEffect, useState } from 'react';
 import { I18nManager, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 
-import { BlueText } from '../../BlueComponents';
+import BlueText from '../../components/BlueText';
 import Azteco from '../../class/azteco';
 import { TWallet } from '../../class/wallets/types';
 import presentAlert from '../../components/Alert';
@@ -13,15 +13,14 @@ import Button from '../../components/Button';
 import SafeArea from '../../components/SafeArea';
 import { useTheme } from '../../components/themes';
 import { useStorage } from '../../hooks/context/useStorage';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import loc from '../../loc';
 import { Chain } from '../../models/bitcoinUnits';
-import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
+import { AztecoRedeemStackParamList } from '../../navigation/AztecoRedeemStack';
 
-type RouteProps = RouteProp<DetailViewStackParamList, 'AztecoRedeem'>;
+type RouteProps = RouteProp<AztecoRedeemStackParamList, 'AztecoRedeem'>;
 
 const AztecoRedeem = () => {
-  const navigation = useExtendedNavigation();
+  const navigation = useNavigation();
   const { wallets } = useStorage();
   const { colors } = useTheme();
   const route = useRoute<RouteProps>();

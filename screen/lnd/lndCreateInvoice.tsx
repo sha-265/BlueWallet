@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { CommonActions, RouteProp, useFocusEffect, useLocale, useRoute } from '@react-navigation/native';
+import { useNavigation, CommonActions, RouteProp, useFocusEffect, useLocale, useRoute } from '@react-navigation/native';
 import { navigationRef, pop } from '../../NavigationService';
 import {
   ActivityIndicator,
@@ -14,7 +14,6 @@ import {
   View,
 } from 'react-native';
 import Icon from '../../components/Icon';
-import { parse } from 'url'; // eslint-disable-line n/no-deprecated-api
 import { btcToSatoshi, fiatToBTC, satoshiToBTC } from '../../blue_modules/currency';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
 import Lnurl from '../../class/lnurl';
@@ -29,29 +28,27 @@ import { useStorage } from '../../hooks/context/useStorage';
 import { DismissKeyboardInputAccessory, DismissKeyboardInputAccessoryViewID } from '../../components/DismissKeyboardInputAccessory';
 import { majorTomToGroundControl, tryToObtainPermissions } from '../../blue_modules/notifications';
 import { BlueLoading } from '../../components/BlueLoading';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation.ts';
-import { LightningArkWallet, LightningCustodianWallet } from '../../class';
+import { LightningArkWallet } from '../../class/wallets/lightning-ark-wallet';
+import { LightningCustodianWallet } from '../../class/wallets/lightning-custodian-wallet';
 import assert from 'assert';
 import { scanQrHelper } from '../../helpers/scan-qr.ts';
-
-type LNDCreateInvoiceRouteParams = {
-  walletID: string;
-  uri: string;
-};
+import { LNDStackParamsList } from '../../navigation/LNDStackParamsList';
+import type { TWallet } from '../../class/wallets/types';
+import { errorMessage } from '../../helpers/errorMessage';
 
 const LNDCreateInvoice = () => {
   const { wallets, saveToDisk } = useStorage();
-  const { uri, walletID } = useRoute<RouteProp<{ params: LNDCreateInvoiceRouteParams }, 'params'>>().params;
-  const wallet = useRef(wallets.find(item => item.getID() === walletID) || wallets.find(item => item.chain === Chain.OFFCHAIN));
+  const { uri, walletID } = useRoute<RouteProp<LNDStackParamsList, 'LNDCreateInvoice'>>().params;
+  const wallet = useRef(wallets.find(item => item.getID() === walletID));
   const { colors } = useTheme();
-  const { navigate, goBack, setParams } = useExtendedNavigation();
+  const { navigate, goBack, setParams } = useNavigation();
   const [unit, setUnit] = useState(wallet.current?.getPreferredBalanceUnit() || BitcoinUnit.BTC);
   const [amount, setAmount] = useState<string>();
   const { direction } = useLocale();
   const [renderWalletSelectionButtonHidden, setRenderWalletSelectionButtonHidden] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [description, setDescription] = useState('');
-  const [lnurlParams, setLNURLParams] = useState<{ k1: any; callback: any; fixed: boolean; min: number; max: number }>();
+  const [lnurlParams, setLNURLParams] = useState<{ k1: string; callback: string; fixed: boolean; min: number; max: number }>();
 
   const styleHooks = StyleSheet.create({
     scanRoot: {
@@ -85,17 +82,9 @@ const LNDCreateInvoice = () => {
   const processLnurl = useCallback(
     async (data: string) => {
       setIsLoading(true);
-      if (!wallet.current) {
-        triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
-        presentAlert({ message: loc.wallets.no_ln_wallet_error });
-        return goBack();
-      }
 
-      // decoding the lnurl
-      const url = Lnurl.getUrlFromLnurl(data);
-      const { query } = parse(String(url), true);
-
-      if (query.tag === Lnurl.TAG_LOGIN_REQUEST) {
+      // lnurl-auth works with any wallet that can sign, so it is checked before the lightning wallet requirement
+      if (Lnurl.isLnurlAuth(data)) {
         // Close the modal first, then navigate to LnurlAuth in the drawer
         goBack();
         setTimeout(() => {
@@ -104,13 +93,22 @@ const LNDCreateInvoice = () => {
               name: 'LnurlAuth',
               params: {
                 lnurl: data,
-                walletID: walletID ?? wallet.current?.getID(),
+                walletID,
               },
             }),
           );
         }, 100);
         return;
       }
+
+      if (!wallet.current) {
+        triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
+        presentAlert({ message: loc.wallets.no_ln_wallet_error });
+        return goBack();
+      }
+
+      // decoding the lnurl
+      const url = Lnurl.getUrlFromLnurl(data);
 
       // calling the url
       try {
@@ -130,7 +128,7 @@ const LNDCreateInvoice = () => {
             screen: 'LnurlPay',
             params: {
               lnurl: data,
-              walletID: walletID ?? wallet.current.getID(),
+              walletID,
             },
           });
           return;
@@ -167,11 +165,11 @@ const LNDCreateInvoice = () => {
         setAmount(newAmount);
         setDescription(reply.defaultDescription);
         setIsLoading(false);
-      } catch (Err: any) {
+      } catch (Err) {
         Keyboard.dismiss();
         setIsLoading(false);
         triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
-        presentAlert({ message: Err.message });
+        presentAlert({ message: errorMessage(Err) });
       }
     },
     [goBack, navigate, unit, walletID],
@@ -201,8 +199,9 @@ const LNDCreateInvoice = () => {
 
   useFocusEffect(
     useCallback(() => {
-      if (wallet.current) {
-        if (wallet.current.getUserHasSavedExport()) {
+      const currentWallet = wallet.current;
+      if (currentWallet) {
+        if (currentWallet.getUserHasSavedExport()) {
           renderReceiveDetails();
         } else {
           presentWalletExportReminder()
@@ -212,7 +211,7 @@ const LNDCreateInvoice = () => {
             .catch(() => {
               pop();
               navigate('WalletExport', {
-                walletID: wallet.current?.getID(),
+                walletID: currentWallet.getID(),
               });
             });
         }
@@ -310,12 +309,12 @@ const LNDCreateInvoice = () => {
 
       navigate('LNDViewInvoice', {
         invoice: invoiceRequest,
-        walletID: wallet.current?.getID(),
+        walletID: wallet.current.getID(),
       });
-    } catch (Err: any) {
+    } catch (Err) {
       triggerHapticFeedback(HapticFeedbackTypes.NotificationError);
       setIsLoading(false);
-      presentAlert({ message: Err.message });
+      presentAlert({ message: errorMessage(Err) });
     }
   };
 
@@ -364,7 +363,7 @@ const LNDCreateInvoice = () => {
       <View style={styles.walletRoot}>
         {!isLoading && (
           <TouchableOpacity accessibilityRole="button" style={styles.walletChooseWrap} onPress={navigateToSelectWallet}>
-            <Text style={styles.walletChooseText}>{loc.wallets.select_wallet.toLowerCase()}</Text>
+            <Text style={styles.walletChooseText}>{loc.wallets.select_wallet}</Text>
             <Icon name={direction === 'rtl' ? 'angle-left' : 'angle-right'} size={18} type="font-awesome" color="#9aa0aa" />
           </TouchableOpacity>
         )}
@@ -381,7 +380,7 @@ const LNDCreateInvoice = () => {
     );
   };
 
-  const onWalletSelect = (selectedWallet: LightningCustodianWallet | LightningArkWallet) => {
+  const onWalletSelect = (selectedWallet: TWallet) => {
     setParams({ walletID: selectedWallet.getID() });
     pop();
   };
@@ -509,6 +508,8 @@ const styles = StyleSheet.create({
     flex: 1,
     marginHorizontal: 8,
     minHeight: 33,
+    fontSize: 15,
+    lineHeight: 19,
     color: '#81868e',
   },
 });

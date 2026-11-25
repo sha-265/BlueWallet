@@ -1,7 +1,8 @@
+import { useNavigation } from '@react-navigation/native';
 import dayjs from 'dayjs';
 import calendar from 'dayjs/plugin/calendar';
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
-import { Keyboard, LayoutAnimation, NativeSyntheticEvent, Platform, StyleSheet, UIManager, View } from 'react-native';
+import { Keyboard, NativeSyntheticEvent, StyleSheet, Text, View } from 'react-native';
 
 import {
   CurrencyRate,
@@ -11,48 +12,42 @@ import {
   setPreferredCurrency,
 } from '../../blue_modules/currency';
 import presentAlert from '../../components/Alert';
-import {
-  SettingsCard,
-  SettingsFlatList,
-  SettingsListItem,
-  SettingsSection,
-  SettingsSubtitle,
-  SettingsText,
-} from '../../components/platform';
+import SafeAreaFlatList from '../../components/SafeAreaFlatList';
+import { SettingsListItem, settingsListCard, settingsSectionHeaderText } from '../../components/SettingsSection';
+import { useTheme } from '../../components/themes';
 import { useSettings } from '../../hooks/context/useSettings';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import loc from '../../loc';
-import { FiatUnit, FiatUnitSource, FiatUnitType, getFiatRate } from '../../models/fiatUnit';
+import { FiatUnit, FiatUnitSource, TFiatUnit, getFiatRate } from '../../models/fiatUnit';
+import { errorMessage } from '../../helpers/errorMessage';
 
 dayjs.extend(calendar);
 
-if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
-  UIManager.setLayoutAnimationEnabledExperimental(true);
-}
-
-const MAX_DISPLAY_ITEMS = 50;
-
 const Currency: React.FC = () => {
   const { setPreferredFiatCurrencyStorage } = useSettings();
-  const [isSavingNewPreferredCurrency, setIsSavingNewPreferredCurrency] = useState<FiatUnitType | undefined>();
-  const [selectedCurrency, setSelectedCurrency] = useState<FiatUnitType>(FiatUnit.USD);
+  const [isSavingNewPreferredCurrency, setIsSavingNewPreferredCurrency] = useState<TFiatUnit | undefined>();
+  const [selectedCurrency, setSelectedCurrency] = useState<TFiatUnit>(FiatUnit.USD);
   const [currencyRate, setCurrencyRate] = useState<CurrencyRate>({
     LastUpdated: null,
     Rate: null,
   });
   const [isSearchFocused, setIsSearchFocused] = useState(false);
-  const { setOptions } = useExtendedNavigation();
+  const { setOptions } = useNavigation();
+  const { colors } = useTheme();
   const [search, setSearch] = useState('');
 
-  const filteredCurrencies = useMemo(() => {
-    if (search.length > 0) {
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
-    }
+  const stylesHook = StyleSheet.create({
+    card: { backgroundColor: colors.cardSectionBackground },
+    infoHeader: { backgroundColor: colors.cardSectionHeaderBackground },
+    infoTitle: { color: colors.foregroundColor },
+    infoSubtitle: { color: colors.alternativeTextColor },
+  });
 
+  const filteredCurrencies = useMemo(() => {
     const searchLower = search.toLowerCase();
-    return Object.values(FiatUnit)
-      .filter(item => item.endPointKey.toLowerCase().includes(searchLower) || item.country.toLowerCase().includes(searchLower))
-      .slice(0, MAX_DISPLAY_ITEMS);
+    // No cap: FlatList virtualises, and a cap silently hid every currency past the 50th unless the user searched
+    return Object.values(FiatUnit).filter(
+      item => item.endPointKey.toLowerCase().includes(searchLower) || item.country.toLowerCase().includes(searchLower),
+    );
   }, [search]);
 
   const fetchCurrency = useCallback(async () => {
@@ -94,13 +89,12 @@ const Currency: React.FC = () => {
   );
 
   const renderItem = useCallback(
-    (props: { item: FiatUnitType; index: number }) => {
+    (props: { item: TFiatUnit; index: number }) => {
       const { item, index } = props;
       const isSelected = selectedCurrency.endPointKey === item.endPointKey;
-      const isDisabled = isSavingNewPreferredCurrency === item || isSelected;
+      // Lock every row while a selection is in flight so two fetches can't race on the stored preference
+      const isDisabled = isSavingNewPreferredCurrency !== undefined || isSelected;
       const isLoading = isSavingNewPreferredCurrency === item;
-      const isFirst = index === 0;
-      const isLast = index === filteredCurrencies.length - 1;
 
       return (
         <SettingsListItem
@@ -115,63 +109,58 @@ const Currency: React.FC = () => {
             Keyboard.dismiss();
             setIsSavingNewPreferredCurrency(item);
             try {
-              await getFiatRate(item.endPointKey);
-              await setPreferredCurrency(item);
-              await initCurrencyDaemon(true);
+              // Fetch once to validate the currency, then hand the rate to the daemon instead of fetching it again
+              const rate = await getFiatRate(item.endPointKey);
+              await setPreferredCurrency(item, rate);
+              await initCurrencyDaemon();
               await fetchCurrency();
               setSelectedCurrency(item);
               setPreferredFiatCurrencyStorage(FiatUnit[item.endPointKey]);
-            } catch (error: any) {
+            } catch (error) {
               console.log(error);
               presentAlert({
-                message: error.message ? `${loc.settings.currency_fetch_error}: ${error.message}` : loc.settings.currency_fetch_error,
+                message: errorMessage(error)
+                  ? `${loc.settings.currency_fetch_error}: ${errorMessage(error)}`
+                  : loc.settings.currency_fetch_error,
               });
             } finally {
               setIsSavingNewPreferredCurrency(undefined);
             }
           }}
-          position={isFirst && isLast ? 'single' : isFirst ? 'first' : isLast ? 'last' : 'middle'}
-          accessibilityLabel={`${item.endPointKey} ${item.symbol} ${item.country}`}
+          bottomDivider={index < filteredCurrencies.length - 1}
         />
       );
     },
     [isSavingNewPreferredCurrency, selectedCurrency, filteredCurrencies.length, fetchCurrency, setPreferredFiatCurrencyStorage],
   );
 
-  const keyExtractor = useCallback((item: FiatUnitType) => `${item.endPointKey}-${item.locale}`, []);
+  const keyExtractor = useCallback((item: TFiatUnit) => `${item.endPointKey}-${item.locale}`, []);
 
-  const ListHeaderComponent = useCallback(() => {
-    if (isSearchFocused || !selectedCurrencyVisible) return null;
-
-    return (
-      <SettingsSection compact>
-        <View style={styles.infoWrapper}>
-          <SettingsCard style={styles.infoCard}>
-            <SettingsText style={styles.infoTitle}>
-              {loc.settings.currency_source} {selectedCurrency?.source ?? FiatUnitSource.CoinDesk}
-            </SettingsText>
-            <SettingsSubtitle style={styles.infoSubtitle}>
-              {loc.settings.rate}: {currencyRate.Rate ?? loc._.never}
-            </SettingsSubtitle>
-            <SettingsSubtitle style={styles.infoSubtitle}>
-              {loc.settings.last_updated}: {dayjs(currencyRate.LastUpdated).calendar() ?? loc._.never}
-            </SettingsSubtitle>
-          </SettingsCard>
-        </View>
-      </SettingsSection>
+  const listHeader =
+    isSearchFocused || !selectedCurrencyVisible ? null : (
+      <View style={[styles.infoHeader, stylesHook.infoHeader]}>
+        <Text style={[settingsSectionHeaderText, styles.infoTitle, stylesHook.infoTitle]}>
+          {loc.settings.currency_source} {selectedCurrency?.source ?? FiatUnitSource.Kraken}
+        </Text>
+        <Text style={[styles.infoSubtitle, stylesHook.infoSubtitle]}>
+          {loc.settings.rate}: {currencyRate.Rate ?? loc._.never}
+        </Text>
+        <Text style={[styles.infoSubtitle, stylesHook.infoSubtitle]}>
+          {loc.settings.last_updated}: {dayjs(currencyRate.LastUpdated).calendar() ?? loc._.never}
+        </Text>
+      </View>
     );
-  }, [isSearchFocused, selectedCurrencyVisible, selectedCurrency?.source, currencyRate]);
 
   return (
-    <SettingsFlatList
+    <SafeAreaFlatList
       data={filteredCurrencies}
       renderItem={renderItem}
       keyExtractor={keyExtractor}
-      ListHeaderComponent={ListHeaderComponent}
+      ListHeaderComponent={listHeader}
+      contentContainerStyle={[settingsListCard, stylesHook.card]}
       contentInsetAdjustmentBehavior="automatic"
       automaticallyAdjustContentInsets
       automaticallyAdjustKeyboardInsets
-      removeClippedSubviews={true}
     />
   );
 };
@@ -179,18 +168,15 @@ const Currency: React.FC = () => {
 export default Currency;
 
 const styles = StyleSheet.create({
-  infoWrapper: {
-    marginBottom: 16,
-    paddingVertical: 12,
-  },
-  infoCard: {
+  infoHeader: {
+    paddingVertical: 16,
     paddingHorizontal: 16,
-    paddingVertical: 12,
   },
   infoTitle: {
     marginBottom: 8,
   },
   infoSubtitle: {
+    fontSize: 14,
     marginTop: 6,
   },
 });

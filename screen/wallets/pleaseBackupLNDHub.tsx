@@ -1,10 +1,10 @@
 import { RouteProp, useNavigation, useRoute } from '@react-navigation/native';
 import React, { useCallback, useEffect, useState } from 'react';
 import { BackHandler, LayoutChangeEvent, StyleSheet, View } from 'react-native';
-import { BlueTextCentered } from '../../BlueComponents';
+import BlueTextCentered from '../../components/BlueTextCentered';
 import Button from '../../components/Button';
 import CopyTextToClipboard from '../../components/CopyTextToClipboard';
-import QRCodeComponent from '../../components/QRCodeComponent';
+import QRCode from '../../components/QRCode';
 import SafeAreaScrollView from '../../components/SafeAreaScrollView';
 import { useTheme } from '../../components/themes';
 import loc from '../../loc';
@@ -12,13 +12,10 @@ import { useSettings } from '../../hooks/context/useSettings';
 import { useScreenProtect } from '../../hooks/useScreenProtect';
 import { BlueSpacing20 } from '../../components/BlueSpacing';
 import useWalletSubscribe from '../../hooks/useWalletSubscribe.tsx';
-
-type PleaseBackupLNDHubRouteParams = {
-  walletID: string;
-};
+import { AddWalletStackParamList } from '../../navigation/AddWalletStack';
 
 const PleaseBackupLNDHub = () => {
-  const { walletID } = useRoute<RouteProp<{ params: PleaseBackupLNDHubRouteParams }, 'params'>>().params;
+  const { walletID } = useRoute<RouteProp<AddWalletStackParamList, 'PleaseBackupLNDHub'>>().params;
   const wallet = useWalletSubscribe(walletID);
   const navigation = useNavigation();
   const { colors } = useTheme();
@@ -40,6 +37,10 @@ const PleaseBackupLNDHub = () => {
       alignItems: 'center',
       padding: 20,
       paddingHorizontal: 30, // Added additional horizontal padding
+    },
+    copyText: {
+      marginVertical: 32,
+      paddingHorizontal: 16,
     },
   });
 
@@ -69,8 +70,10 @@ const PleaseBackupLNDHub = () => {
         <BlueSpacing20 />
       </View>
       <BlueSpacing20 />
-      <QRCodeComponent value={wallet.getSecret()} size={qrCodeSize} />
-      <CopyTextToClipboard text={wallet.getSecret()} />
+      <QRCode value={wallet.getSecret()} size={qrCodeSize} />
+      <View style={styles.copyText}>
+        <CopyTextToClipboard text={wallet.getSecret()} />
+      </View>
       <BlueSpacing20 />
       <Button onPress={dismiss} title={loc.pleasebackup.ok_lnd} />
     </SafeAreaScrollView>

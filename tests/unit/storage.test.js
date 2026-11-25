@@ -1,11 +1,14 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import assert from 'assert';
 
-import { BlueApp, HDSegwitBech32Wallet, SegwitP2SHWallet, WatchOnlyWallet } from '../../class';
+import { BlueApp } from '../../class/blue-app';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
+import { SegwitP2SHWallet } from '../../class/wallets/segwit-p2sh-wallet';
+import { WatchOnlyWallet } from '../../class/wallets/watch-only-wallet';
 
 jest.mock('../../blue_modules/BlueElectrum', () => {
   return {
-    connectMain: jest.fn(),
+    ensureConnected: jest.fn().mockResolvedValue(true),
   };
 });
 
@@ -516,6 +519,23 @@ it('can decrypt storage that is second in a list of buckets; and isPasswordInUse
   const storage5loadResult = await Storage7.loadFromDisk();
   assert.ok(storage5loadResult);
   assert.strictEqual(Storage7.wallets[0].getLabel(), 'fakewallet');
+});
+
+it('Appstorage - address_metadata labels: set, persist', async () => {
+  const addr = 'bc1qaxxc4gwx6rd6rymq08qwpxhesd4jqu93lvjsyt';
+
+  /** @type {BlueApp} */
+  const Storage = new BlueApp();
+  const w = new SegwitP2SHWallet();
+  await w.generate();
+  Storage.wallets.push(w);
+
+  Storage.address_metadata[addr] = { label: 'rent' };
+  await Storage.saveToDisk();
+
+  const Storage2 = new BlueApp();
+  await Storage2.loadFromDisk();
+  assert.strictEqual(Storage2.address_metadata[addr].label, 'rent');
 });
 
 it('Appstorage - hashIt() works', async () => {

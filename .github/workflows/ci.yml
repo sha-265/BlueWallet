@@ -14,16 +14,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout project
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       with:
         fetch-depth: 0
 
     - name: Specify node version
-      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
       with:
         node-version: 24
         cache: 'npm'
-        cache-dependency-path: package-lock.json
+
+    - name: Set npm version
+      working-directory: ${{ runner.temp }}
+      run: npm install --global npm@12.2.2
 
     - name: Install node_modules
       run: npm ci || npm ci
@@ -35,16 +38,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout project
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       with:
         fetch-depth: 0
 
     - name: Specify node version
-      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
       with:
         node-version: 24
         cache: 'npm'
-        cache-dependency-path: package-lock.json
+
+    - name: Set npm version
+      working-directory: ${{ runner.temp }}
+      run: npm install --global npm@12.2.2
 
     - name: Install node_modules
       run: npm ci || npm ci
@@ -55,6 +61,7 @@ jobs:
         BIP47_HD_MNEMONIC: ${{ secrets.BIP47_HD_MNEMONIC}}
         HD_MNEMONIC: ${{ secrets.HD_MNEMONIC }}
         HD_MNEMONIC_BIP49: ${{ secrets.HD_MNEMONIC_BIP49 }}
+        HD_MNEMONIC_OLD: ${{ secrets.HD_MNEMONIC_OLD }}
         HD_MNEMONIC_BIP49_MANY_TX: ${{ secrets.HD_MNEMONIC_BIP49_MANY_TX }}
         HD_MNEMONIC_BIP84: ${{ secrets.HD_MNEMONIC_BIP84 }}
         HD_MNEMONIC_BREAD: ${{ secrets.HD_MNEMONIC_BREAD }}
@@ -66,16 +73,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - name: Checkout project
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       with:
         fetch-depth: 0
 
     - name: Specify node version
-      uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+      uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
       with:
         node-version: 24
         cache: 'npm'
-        cache-dependency-path: package-lock.json
+
+    - name: Set npm version
+      working-directory: ${{ runner.temp }}
+      run: npm install --global npm@12.2.2
 
     - name: Install node_modules
       run: npm ci || npm ci
@@ -86,10 +96,12 @@ jobs:
         BIP47_HD_MNEMONIC: ${{ secrets.BIP47_HD_MNEMONIC}}
         HD_MNEMONIC: ${{ secrets.HD_MNEMONIC }}
         HD_MNEMONIC_BIP49: ${{ secrets.HD_MNEMONIC_BIP49 }}
+        HD_MNEMONIC_OLD: ${{ secrets.HD_MNEMONIC_OLD }}
         HD_MNEMONIC_BIP49_MANY_TX: ${{ secrets.HD_MNEMONIC_BIP49_MANY_TX }}
         HD_MNEMONIC_BIP84: ${{ secrets.HD_MNEMONIC_BIP84 }}
         HD_MNEMONIC_BREAD: ${{ secrets.HD_MNEMONIC_BREAD }}
         FAULTY_ZPUB: ${{ secrets.FAULTY_ZPUB }}
         MNEMONICS_COBO: ${{ secrets.MNEMONICS_COBO }}
         MNEMONICS_COLDCARD: ${{ secrets.MNEMONICS_COLDCARD }}
+        MNEMONICS_KEYSTONE: ${{ secrets.MNEMONICS_KEYSTONE }}
         RETRY: 1

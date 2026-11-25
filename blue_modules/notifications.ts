@@ -8,22 +8,24 @@ import {
   Notifications,
 } from 'react-native-notifications';
 import { checkNotifications, requestNotifications, RESULTS } from 'react-native-permissions';
+import type { BoltzReverseSwap } from '@arkade-os/boltz-swap';
 import loc from '../loc';
-import { groundControlUri } from './constants';
+import { arkadePaymentPushUri, groundControlUri } from './constants';
 import { fetch } from '../util/fetch';
+import { errorMessage } from '../helpers/errorMessage';
 
 const PUSH_TOKEN = 'PUSH_TOKEN';
-const GROUNDCONTROL_BASE_URI = 'GROUNDCONTROL_BASE_URI';
 const NOTIFICATIONS_STORAGE = 'NOTIFICATIONS_STORAGE';
 const ANDROID_NOTIFICATION_CHANNEL_ID = 'channel_01';
 export const NOTIFICATIONS_NO_AND_DONT_ASK_FLAG = 'NOTIFICATIONS_NO_AND_DONT_ASK_FLAG';
-let baseURI = groundControlUri;
+const baseURI = groundControlUri;
 let notificationSubscriptions: EmitterSubscription[] = [];
 let onProcessNotificationsHandler: undefined | (() => void | Promise<void>);
 const handledNotificationKeys = new Set<string>();
 let pendingRegistrationPromise: Promise<boolean> | null = null;
 let pendingRegistrationResolve: ((value: boolean) => void) | null = null;
 let pendingRegistrationTimeout: ReturnType<typeof setTimeout> | undefined;
+let lastPostedToken: TPushToken | null = null;
 
 type TPushToken = {
   token: string;
@@ -41,7 +43,10 @@ type TPayload = {
   txid: string;
   type: number;
   hash: string;
-  [key: string]: any;
+  walletID?: string;
+  swapId?: string;
+  pr?: string;
+  data?: Record<string, unknown>;
 };
 
 function deepClone<T>(obj: T): T {
@@ -111,9 +116,10 @@ const markNotificationHandled = (key: string) => {
 
 const normalizeNotificationPayload = (notification: RNNotification, status: Pick<TPayload, 'foreground' | 'userInteraction'>): TPayload => {
   const rawPayload =
-    notification.payload && typeof notification.payload === 'object' ? (deepClone(notification.payload) as Record<string, any>) : {};
-  const nestedPayload = rawPayload.data && typeof rawPayload.data === 'object' ? rawPayload.data : {};
-  const nestedData = nestedPayload.data && typeof nestedPayload.data === 'object' ? nestedPayload.data : {};
+    notification.payload && typeof notification.payload === 'object' ? (deepClone(notification.payload) as Record<string, unknown>) : {};
+  const asRecord = (v: unknown): Record<string, unknown> => (v && typeof v === 'object' ? (v as Record<string, unknown>) : {});
+  const nestedPayload = asRecord(rawPayload.data);
+  const nestedData = asRecord(nestedPayload.data);
 
   const payload: TPayload = {
     ...rawPayload,
@@ -252,6 +258,29 @@ export const tryToObtainPermissions = async (): Promise<boolean> => {
     return false;
   }
 };
+
+export const enqueueTestPushNotification = async (): Promise<void> => {
+  const pushToken = await getPushToken();
+  if (!pushToken?.token || !pushToken?.os) {
+    throw new Error('No push token available');
+  }
+
+  const response = await fetch(`${baseURI}/enqueue`, {
+    method: 'POST',
+    headers: _getHeaders(),
+    body: JSON.stringify({
+      type: 5,
+      token: pushToken.token,
+      os: pushToken.os,
+      text: 'Test push notification',
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(`Enqueue request failed with status ${response.status}: ${response.statusText}`);
+  }
+};
+
 /**
  * Submits onchain bitcoin addresses and ln invoice preimage hashes to GroundControl server, so later we could
  * be notified if they were paid
@@ -328,6 +357,44 @@ export const majorTomToGroundControl = async (addresses: string[], hashes: strin
 };
 
 /**
+ * Registers an Ark swap with the bitcoin-payment-push-service so the device is
+ * pushed when the invoice gets paid. Fire-and-forget: never throws, gated by
+ * the same opt-out/token rules as majorTomToGroundControl(). The swap's
+ * preimage is always stripped before leaving the device.
+ */
+export const registerArkPaymentPush = async (paymentHash: string, label: string, pendingSwap: BoltzReverseSwap): Promise<void> => {
+  if (!arkadePaymentPushUri) return;
+  try {
+    const noAndDontAskFlag = await AsyncStorage.getItem(NOTIFICATIONS_NO_AND_DONT_ASK_FLAG);
+    if (noAndDontAskFlag === 'true') {
+      console.warn('User has opted out of notifications.');
+      return;
+    }
+
+    const pushToken = await getPushToken();
+    if (!pushToken || !pushToken.token || !pushToken.os) {
+      return;
+    }
+
+    const response = await fetch(`${arkadePaymentPushUri}/register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        topic: paymentHash,
+        label,
+        swap: { ...pendingSwap, preimage: '' },
+      }),
+    });
+    if (!response.ok) {
+      throw new Error(`status ${response.status}`);
+    }
+    console.log('[ARK] payment push registration ok');
+  } catch (e) {
+    console.log('[ARK] payment push registration failed:', errorMessage(e));
+  }
+};
+
+/**
  * Returns a permissions object:
  * alert: boolean
  * badge: boolean
@@ -397,6 +464,35 @@ export const setLevels = async (levelAll: boolean) => {
   } catch (error) {
     console.error('Error setting notification levels:', error);
   }
+};
+
+/**
+ * Posts to groundcontrol whether push notification text/data
+ *  for this device should be redacted
+ *
+ * @param redacted {Boolean}
+ * @returns {Promise<void>}
+ */
+export const setRedactNotifications = async (redacted: boolean) => {
+  const pushToken = await getPushToken();
+  if (!pushToken?.token || !pushToken?.os) {
+    throw new Error('No push token available');
+  }
+
+  const response = await fetch(`${baseURI}/setTokenConfiguration`, {
+    method: 'POST',
+    headers: _getHeaders(),
+    body: JSON.stringify({ redacted, token: pushToken.token, os: pushToken.os }),
+  });
+
+  if (!response.ok) {
+    throw new Error('Failed to set redact configuration: ' + response.statusText);
+  }
+};
+
+export const isNotificationsRedacted = async (): Promise<boolean> => {
+  const levels = await getLevels();
+  return !!levels?.redacted;
 };
 
 export const addNotification = async (notification: TPayload) => {
@@ -485,7 +581,13 @@ const configureNotifications = async (onProcessNotifications?: () => void): Prom
             console.log('configureNotifications: Token received:', token);
           }
           await _setPushToken(token);
-          await postTokenConfig().catch(error => console.error('Failed to post token configuration:', error));
+          // Only post token configuration if token has changed (fixes issue #2255)
+          // This prevents excessive calls to GroundControl's setTokenConfiguration endpoint
+          const tokenChanged = !lastPostedToken || lastPostedToken.token !== token.token;
+          if (tokenChanged) {
+            lastPostedToken = token;
+            await postTokenConfig().catch(error => console.error('Failed to post token configuration:', error));
+          }
           settlePendingRegistration(true);
         }),
         Notifications.events().registerRemoteNotificationsRegistrationFailed(error => {
@@ -525,22 +627,6 @@ const configureNotifications = async (onProcessNotifications?: () => void): Prom
     return await waitForRemoteRegistration();
   } catch (error) {
     console.error('Error in configureNotifications:', error);
-    return false;
-  }
-};
-
-/**
- * Validates whether the provided GroundControl URI is valid by pinging it.
- *
- * @param uri {string}
- * @returns {Promise<boolean>} TRUE if valid, FALSE otherwise
- */
-export const isGroundControlUriValid = async (uri: string) => {
-  try {
-    const response = await fetch(`${uri}/ping`, { headers: _getHeaders() });
-    const json = await response.json();
-    return !!json.description;
-  } catch (_) {
     return false;
   }
 };
@@ -619,8 +705,7 @@ export const unsubscribe = async (addresses: string[], hashes: string[], txids: 
     });
 
     if (!response.ok) {
-      console.error('Failed to unsubscribe:', response.statusText);
-      return;
+      throw new Error(`Unsubscribe request failed with status ${response.status}: ${response.statusText}`);
     }
 
     return response;
@@ -643,7 +728,7 @@ export const clearStoredNotifications = async () => {
   } catch (_) {}
 };
 
-export const getDeliveredNotifications: () => Promise<Record<string, any>[]> = () => {
+export const getDeliveredNotifications: () => Promise<TPayload[]> = () => {
   try {
     if (Platform.OS !== 'ios') {
       return Promise.resolve([]);
@@ -674,38 +759,6 @@ export const setApplicationIconBadgeNumber = (badges: number) => {
 
 export const removeAllDeliveredNotifications = () => {
   Notifications.removeAllDeliveredNotifications();
-};
-
-export const getDefaultUri = () => {
-  return groundControlUri;
-};
-
-export const saveUri = async (uri: string) => {
-  try {
-    baseURI = uri || groundControlUri;
-    await AsyncStorage.setItem(GROUNDCONTROL_BASE_URI, baseURI);
-  } catch (error) {
-    console.error('Error saving URI:', error);
-    throw error;
-  }
-};
-
-export const getSavedUri = async () => {
-  try {
-    const baseUriStored = await AsyncStorage.getItem(GROUNDCONTROL_BASE_URI);
-    if (baseUriStored) {
-      baseURI = baseUriStored;
-    }
-    return baseUriStored;
-  } catch (e) {
-    console.error(e);
-    try {
-      await AsyncStorage.setItem(GROUNDCONTROL_BASE_URI, groundControlUri);
-    } catch (storageError) {
-      console.error('Failed to reset URI:', storageError);
-    }
-    throw e;
-  }
 };
 
 export const isNotificationsEnabled = async () => {
@@ -757,10 +810,6 @@ export const initializeNotifications = async (onProcessNotifications?: () => voi
       return;
     }
 
-    const baseUriStored = await AsyncStorage.getItem(GROUNDCONTROL_BASE_URI);
-    baseURI = baseUriStored || groundControlUri;
-    console.log('Base URI set to:', baseURI);
-
     setApplicationIconBadgeNumber(0);
 
     // Only check permissions, never request
@@ -781,7 +830,5 @@ export const initializeNotifications = async (onProcessNotifications?: () => voi
     }
   } catch (error) {
     console.error('Failed to initialize notifications:', error);
-    baseURI = groundControlUri;
-    await AsyncStorage.setItem(GROUNDCONTROL_BASE_URI, groundControlUri).catch(err => console.error('Failed to reset URI:', err));
   }
 };

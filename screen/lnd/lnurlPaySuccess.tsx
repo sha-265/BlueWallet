@@ -1,16 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Image, Linking, ScrollView, StyleSheet, View } from 'react-native';
-import { BlueButtonLink, BlueCard, BlueText } from '../../BlueComponents';
+import BlueButtonLink from '../../components/BlueButtonLink';
+import BlueCard from '../../components/BlueCard';
+import BlueText from '../../components/BlueText';
 import Lnurl from '../../class/lnurl';
 import Button from '../../components/Button';
 import SafeArea from '../../components/SafeArea';
 import loc from '../../loc';
 import { SuccessView } from '../send/success';
 import { popToTop } from '../../NavigationService';
-import { useRoute, RouteProp } from '@react-navigation/native';
+import { useNavigation, useRoute, RouteProp } from '@react-navigation/native';
 import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation.ts';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { BlueSpacing20, BlueSpacing40 } from '../../components/BlueSpacing';
 import { BlueLoading } from '../../components/BlueLoading.tsx';
@@ -20,7 +21,7 @@ type LnurlPaySuccessNavigationProp = NativeStackNavigationProp<DetailViewStackPa
 
 const LnurlPaySuccess: React.FC = () => {
   const route = useRoute<LnurlPaySuccessRouteProp>();
-  const { navigate } = useExtendedNavigation<LnurlPaySuccessNavigationProp>();
+  const { navigate } = useNavigation<LnurlPaySuccessNavigationProp>();
   const { paymentHash, fromWalletID, justPaid } = route.params;
   console.log({ paymentHash, fromWalletID, justPaid });
 
@@ -114,7 +115,6 @@ const LnurlPaySuccess: React.FC = () => {
                 navigate('ScanLNDInvoiceRoot', {
                   screen: 'LnurlPay',
                   params: {
-                    // @ts-ignore  fixme
                     lnurl,
                     walletID: fromWalletID,
                   },

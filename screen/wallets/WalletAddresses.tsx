@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useLayoutEffect, useRef, useReducer, useMemo } from 'react';
-import { useRoute, RouteProp, useFocusEffect } from '@react-navigation/native';
-import { ActivityIndicator, FlatList, StyleSheet, View, Platform, UIManager } from 'react-native';
-import { WatchOnlyWallet } from '../../class';
+import { useNavigation, useRoute, RouteProp, useFocusEffect } from '@react-navigation/native';
+import { ActivityIndicator, FlatList, StyleSheet, View } from 'react-native';
+import { WatchOnlyWallet } from '../../class/wallets/watch-only-wallet';
+import { AbstractHDElectrumWallet } from '../../class/wallets/abstract-hd-electrum-wallet';
 import { AddressItem } from '../../components/addresses/AddressItem';
 import { useTheme } from '../../components/themes';
 import { useStorage } from '../../hooks/context/useStorage';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
-import SegmentedControl from '../../components/SegmentControl';
+import SegmentedControl from '../../components/SegmentedControl';
 import loc from '../../loc';
 import { BitcoinUnit } from '../../models/bitcoinUnits';
 import { useSettings } from '../../hooks/context/useSettings';
@@ -20,10 +20,6 @@ export const TABS = {
 } as const;
 
 type TabKey = keyof typeof TABS;
-
-if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
-  UIManager.setLayoutAnimationEnabledExperimental(true);
-}
 
 interface Address {
   key: string;
@@ -76,7 +72,13 @@ const reducer = (state: WalletAddressesState, action: WalletAddressesAction): Wa
 
 export const totalBalance = ({ c, u } = { c: 0, u: 0 }) => c + u;
 
-export const getAddress = (wallet: any, index: number, isInternal: boolean): Address => {
+/** what getAddress reads off an HD wallet; only the length of the tx lists */
+type AddressSource = Pick<
+  AbstractHDElectrumWallet,
+  '_getInternalAddressByIndex' | '_getExternalAddressByIndex' | '_balances_by_internal_index' | '_balances_by_external_index'
+> & { _txs_by_internal_index: Record<number, unknown[]>; _txs_by_external_index: Record<number, unknown[]> };
+
+export const getAddress = (wallet: AddressSource, index: number, isInternal: boolean): Address => {
   let address: string;
   let balance = 0;
   let transactions = 0;
@@ -123,7 +125,7 @@ const WalletAddresses: React.FC = () => {
   const { walletID } = useRoute<RouteProps>().params;
 
   const addressList = useRef<FlatList<Address>>(null);
-  const wallet = wallets.find((w: any) => w.getID() === walletID);
+  const wallet = wallets.find(w => w.getID() === walletID);
 
   const balanceUnit = wallet?.getPreferredBalanceUnit() ?? BitcoinUnit.BTC;
   const isWatchOnly = wallet?.type === WatchOnlyWallet.type;
@@ -133,7 +135,7 @@ const WalletAddresses: React.FC = () => {
   const { colors } = useTheme();
   const { isPrivacyBlurEnabled } = useSettings();
   const { enableScreenProtect, disableScreenProtect } = useScreenProtect();
-  const { setOptions } = useExtendedNavigation<NavigationProps>();
+  const { setOptions } = useNavigation<NavigationProps>();
 
   const stylesHook = StyleSheet.create({
     root: {
@@ -153,23 +155,23 @@ const WalletAddresses: React.FC = () => {
   );
 
   const getAddresses = useMemo(() => {
-    if (!walletInstance) return [];
+    if (!(walletInstance instanceof AbstractHDElectrumWallet)) return [];
     const newAddresses: Address[] = [];
-    const changeMaxIndex = 'next_free_change_address_index' in walletInstance ? walletInstance.next_free_change_address_index : 0;
+    const changeMaxIndex = walletInstance.next_free_change_address_index;
     for (let index = 0; index <= changeMaxIndex; index++) {
       try {
         newAddresses.push(getAddress(walletInstance, index, true));
-      } catch (error: any) {
+      } catch (error) {
         console.error('error', error);
       }
     }
 
-    const gapLimit = 'gap_limit' in walletInstance ? walletInstance.gap_limit : 0;
-    const addressMaxIndex = 'next_free_address_index' in walletInstance ? walletInstance.next_free_address_index : 0;
+    const gapLimit = walletInstance.gap_limit;
+    const addressMaxIndex = walletInstance.next_free_address_index;
     for (let index = 0; index < addressMaxIndex + gapLimit; index++) {
       try {
         newAddresses.push(getAddress(walletInstance, index, false));
-      } catch (error: any) {
+      } catch (error) {
         console.error('error', error);
       }
     }
@@ -246,9 +248,11 @@ const WalletAddresses: React.FC = () => {
       automaticallyAdjustContentInsets
       automaticallyAdjustsScrollIndicatorInsets
       automaticallyAdjustKeyboardInsets
+      scrollToOverflowEnabled
       ListHeaderComponent={
         <View style={styles.segmentedHeader}>
           <SegmentedControl
+            usePlatformStyle
             values={Object.values(TABS).map(tab => loc.addresses[`type_${tab}`])}
             selectedIndex={Object.values(TABS).findIndex(tab => tab === currentTab)}
             onChange={index => {

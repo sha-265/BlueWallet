@@ -1,0 +1,111 @@
+import { readFileSync } from 'fs';
+import path from 'path';
+import { availableMenuActions, nativeSendDetailsAction } from '../../blue_modules/menuActions';
+import { CommonToolTipActions } from '../../typings/CommonToolTipActions';
+
+it('loads native actions before wallet translations are needed and resolves shortcut labels at display time', () => {
+  const translations: { wallets?: { details_export_bip329_shortcut: string; details_export_bip329_availability: string } } = {};
+  jest.isolateModules(() => {
+    jest.doMock('../../loc', () => ({ __esModule: true, default: translations }));
+    const { availableMenuActions: available, menuShortcuts } = require('../../blue_modules/menuActions');
+    expect(available(undefined, [], false)).toEqual([]);
+    translations.wallets = {
+      details_export_bip329_shortcut: 'Export wallet labels',
+      details_export_bip329_availability: 'Wallets with transactions or owned labels',
+    };
+    const shortcut = menuShortcuts.find((item: { key: string }) => item.key === 'Alt+Shift+B');
+    expect(shortcut.title).toBe('Export wallet labels');
+    expect(shortcut.where).toBe('Wallets with transactions or owned labels');
+    translations.wallets.details_export_bip329_shortcut = 'Translated export';
+    expect(shortcut.title).toBe('Translated export');
+  });
+  jest.dontMock('../../loc');
+});
+
+it('maps Send Details tooltip identifiers to native menu actions without changing the shared identifiers', () => {
+  expect(CommonToolTipActions.AddRecipient.id).toBe('AddRecipient');
+  expect(CommonToolTipActions.RemoveRecipient.id).toBe('RemoveRecipient');
+  expect(CommonToolTipActions.RemoveAllRecipients.id).toBe('RemoveAllRecipients');
+  expect(nativeSendDetailsAction(CommonToolTipActions.AddRecipient.id)).toBe('add_recipient');
+  expect(nativeSendDetailsAction(CommonToolTipActions.RemoveRecipient.id)).toBe('remove_recipient');
+  expect(nativeSendDetailsAction(CommonToolTipActions.RemoveAllRecipients.id)).toBe('remove_all_recipients');
+  expect(nativeSendDetailsAction(CommonToolTipActions.SendMax.id)).toBe('send_max');
+  expect(nativeSendDetailsAction('unknown')).toBeUndefined();
+});
+
+describe('native menu availability', () => {
+  const globalActions = [
+    'settings',
+    'manageWallets',
+    'isItMyAddress',
+    'broadcastTransaction',
+    'generateWord',
+    'keyboardShortcuts',
+    'openFile',
+  ];
+  it.each([undefined, 'UnlockWithScreen', 'WalletTransactions', 'Settings', 'SendDetails'])(
+    'hides everything while locked on %s',
+    screen => {
+      expect(availableMenuActions(screen, ['send', 'reloadTransactions', 'copyAddress'], false)).toEqual([]);
+    },
+  );
+  it.each(['Settings', 'SendDetails', 'ImportWallet', 'WalletExport', 'KeyboardShortcuts'])(
+    'keeps Settings and shortcuts available on %s',
+    screen => {
+      expect(availableMenuActions(screen, [], true)).toEqual(globalActions);
+    },
+  );
+  it('only offers actions registered by the current screen', () => {
+    expect(availableMenuActions('WalletTransactions', ['receive'], true)).toEqual([
+      ...globalActions,
+      'addWallet',
+      'importWallet',
+      'backToWallets',
+      'receive',
+    ]);
+    expect(availableMenuActions('ReceiveDetails', ['send', 'copyAddress'], true)).toEqual([
+      ...globalActions,
+      'backToWallets',
+      'copyAddress',
+    ]);
+    expect(availableMenuActions('TransactionStatus', ['copyTransactionId', 'accelerateTransaction'], true)).toEqual([
+      ...globalActions,
+      'backToWallets',
+      'copyTransactionId',
+      'accelerateTransaction',
+    ]);
+    expect(availableMenuActions('WalletsList', [], true)).not.toContain('backToWallets');
+  });
+
+  it('only exposes registered Send Details header actions', () => {
+    expect(availableMenuActions('SendDetails', ['add_recipient', 'coin_control', 'sign_psbt'], true)).toEqual([
+      ...globalActions,
+      'add_recipient',
+      'sign_psbt',
+      'coin_control',
+    ]);
+  });
+
+  it('routes each Wallet Details command to the same Android action ID', () => {
+    const commands = [
+      'editWalletName',
+      'showAddresses',
+      'showXpub',
+      'signVerify',
+      'coin_control',
+      'importWalletNotes',
+      'exportWalletBackup',
+      'exportAccountingCsv',
+      'exportBip329Backup',
+      'deleteWallet',
+    ] as const;
+    const androidMenu = readFileSync(
+      path.join(__dirname, '../../android/app/src/main/java/io/bluewallet/bluewallet/WalletMenuAction.kt'),
+      'utf8',
+    );
+    const androidIds = Array.from(androidMenu.matchAll(/^\s*[A-Z][A-Z0-9_]*\("([^"]+)"/gm), match => match[1]);
+
+    expect(availableMenuActions('WalletDetails', commands, true)).toEqual([...globalActions, 'backToWallets', ...commands]);
+    expect(commands.filter(command => !androidIds.includes(command))).toEqual([]);
+  });
+});

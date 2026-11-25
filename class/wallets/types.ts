@@ -20,22 +20,25 @@ import { TaprootWallet } from './taproot-wallet.ts';
 import { HDTaprootWallet } from './hd-taproot-wallet.ts';
 import { LightningArkWallet } from './lightning-ark-wallet.ts';
 
+/**
+ * An unspent output as the wallet stores it (`_utxo`, `getUtxo()`, CoinControl).
+ * BlueElectrum.multiGetUtxoByAddress builds it from the raw electrum listunspent row; the wallet then adds
+ * txhex (legacy inputs), confirmations and wif.
+ */
 export type Utxo = {
-  // Returned by BlueElectrum
   height: number;
   address: string;
   txid: string;
   vout: number;
   value: number;
 
-  // Others
   txhex?: string;
   confirmations?: number;
   wif?: string | false;
 };
 
 /**
- * same as coinselect.d.ts/CoinSelectUtxo
+ * What createTransaction / coinselect need from a utxo. A stored `Utxo` satisfies it.
  */
 export interface CreateTransactionUtxo extends CoinSelectUtxo {}
 
@@ -59,11 +62,13 @@ export type CreateTransactionResult = {
   psbt: bitcoin.Psbt;
 };
 
-type TransactionInput = {
-  txid: string;
-  vout: number;
-  scriptSig: { asm: string; hex: string };
-  txinwitness: string[];
+export type TransactionInput = {
+  // a coinbase input has `coinbase` instead of txid, vout and scriptSig
+  txid?: string;
+  vout?: number;
+  scriptSig?: { asm: string; hex: string };
+  coinbase?: string;
+  txinwitness?: string[];
   sequence: number;
   addresses?: string[];
   address?: string;
@@ -76,9 +81,11 @@ export type TransactionOutput = {
   scriptPubKey: {
     asm: string;
     hex: string;
-    reqSigs: number;
+    reqSigs?: number;
     type: string;
-    addresses: string[];
+    // bitcoin core 22.0.0+ sends `address` instead of `reqSigs` and `addresses`. OP_RETURN and such have none of them
+    addresses?: string[];
+    address?: string;
   };
 };
 
@@ -86,24 +93,29 @@ export interface DecodedInvoice {
   destination: string;
   payment_hash: string;
   num_satoshis: number;
+  num_millisatoshis: number;
   timestamp: number;
   expiry: number;
   description: string;
   description_hash: string;
   fallback_addr: string;
   cltv_expiry: string;
-  route_hints: any[];
-  [key: string]: any;
+  route_hints: unknown[];
 }
 
 export type LightningTransaction = {
   memo?: string;
   type?: 'user_invoice' | 'payment_request' | 'bitcoind_tx' | 'paid_invoice';
-  payment_hash?: string | { data: string };
+  payment_hash?: string | { data: number[] }; // lndhub serializes a Buffer
   category?: 'receive';
   timestamp: number; // seconds, not milliseconds
   expire_time?: number;
   ispaid?: boolean;
+  // Terminal non-success state (failed/refunded/expired swap). Distinct from
+  // `ispaid:false`, which on its own only means "not settled yet" and is also
+  // true for in-flight rows. Consumers that gate on pending vs. dead state
+  // (e.g. the wallet-card pending pill) must treat `failed` rows as terminal.
+  failed?: boolean;
   walletID?: string;
   value?: number;
   amt?: number;
@@ -123,12 +135,15 @@ export type Transaction = {
   locktime: number;
   inputs: TransactionInput[];
   outputs: TransactionOutput[];
-  blockhash: string;
-  confirmations: number;
-  time: number;
-  blocktime: number;
+  // Confirmation-only fields: absent on mempool (unconfirmed) responses.
+  blockhash?: string;
+  confirmations?: number;
+  time?: number;
+  blocktime?: number;
   timestamp: number; // seconds, not milliseconds
   value?: number;
+  /** only when the row came straight from an electrum server that reports it */
+  fee?: number;
 
   /**
    * if known, who is on the other end of the transaction (BIP47 payment code)

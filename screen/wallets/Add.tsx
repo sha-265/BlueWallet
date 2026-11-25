@@ -1,40 +1,42 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useState } from 'react';
-import { ActivityIndicator, Alert, Keyboard, Linking, Platform, StyleSheet, TextInput, useColorScheme, View } from 'react-native';
+import { ActivityIndicator, Alert, Keyboard, Linking, StyleSheet, TextInput, View } from 'react-native';
 import Animated, { Layout } from 'react-native-reanimated';
 import assert from 'assert';
 
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
-import { BlueButtonLink, BlueFormLabel, BlueText } from '../../BlueComponents';
-import { HDSegwitBech32Wallet, HDTaprootWallet, LightningCustodianWallet, HDLegacyP2PKHWallet } from '../../class';
+import BlueButtonLink from '../../components/BlueButtonLink';
+import BlueFormLabel from '../../components/BlueFormLabel';
+import BlueText from '../../components/BlueText';
+import { HDLegacyP2PKHWallet } from '../../class/wallets/hd-legacy-p2pkh-wallet';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
+import { HDTaprootWallet } from '../../class/wallets/hd-taproot-wallet';
+import { LightningCustodianWallet } from '../../class/wallets/lightning-custodian-wallet';
 import presentAlert from '../../components/Alert';
 import Button from '../../components/Button';
+import Icon from '../../components/Icon';
 import { useTheme } from '../../components/themes';
 import WalletButton from '../../components/WalletButton';
 import loc from '../../loc';
 import { Chain } from '../../models/bitcoinUnits';
 import { useStorage } from '../../hooks/context/useStorage';
-import { CommonToolTipActions } from '../../typings/CommonToolTipActions';
-import { Action } from '../../components/types';
 import { getLNDHub } from '../../helpers/lndHub';
-import HeaderMenuButton from '../../components/HeaderMenuButton';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { AddWalletStackParamList } from '../../navigation/AddWalletStack';
-import { RouteProp, useRoute } from '@react-navigation/native';
+import { useNavigation, RouteProp, useRoute } from '@react-navigation/native';
 import SafeAreaScrollView from '../../components/SafeAreaScrollView';
 import { BlueSpacing20, BlueSpacing40 } from '../../components/BlueSpacing';
-import { hexToUint8Array, uint8ArrayToHex } from '../../blue_modules/uint8array-extras';
+import { hexToUint8Array } from '../../blue_modules/uint8array-extras';
 import { LightningArkWallet } from '../../class/wallets/lightning-ark-wallet.ts';
 import { resetScanWasBBQR } from '../../helpers/scan-qr.ts';
+import { errorMessage } from '../../helpers/errorMessage';
 
-enum ButtonSelected {
-  // @ts-ignore: Return later to update
-  ONCHAIN = Chain.ONCHAIN,
-  // @ts-ignore: Return later to update
-  OFFCHAIN = Chain.OFFCHAIN,
-  VAULT = 'VAULT',
-  ARK = 'ARK',
-}
+const ButtonSelected = {
+  ONCHAIN: Chain.ONCHAIN,
+  OFFCHAIN: Chain.OFFCHAIN,
+  VAULT: 'VAULT',
+  ARK: 'ARK',
+} as const;
+type ButtonSelected = (typeof ButtonSelected)[keyof typeof ButtonSelected];
 
 interface State {
   isLoading: boolean;
@@ -53,10 +55,11 @@ const ActionTypes = {
 } as const;
 type ActionTypes = (typeof ActionTypes)[keyof typeof ActionTypes];
 
-interface TAction {
-  type: ActionTypes;
-  payload?: any;
-}
+type TAction =
+  | { type: typeof ActionTypes.SET_LOADING; payload: boolean }
+  | { type: typeof ActionTypes.SET_WALLET_BASE_URI | typeof ActionTypes.SET_LABEL; payload: string }
+  | { type: typeof ActionTypes.SET_SELECTED_INDEX; payload: number }
+  | { type: typeof ActionTypes.SET_SELECTED_WALLET_TYPE; payload: ButtonSelected };
 
 const index2walletType: Record<number, { text: string; subtitle: string; walletType: string }> = {
   0: { subtitle: 'p2wpkh/HD', text: `${loc.multisig.native_segwit_title}`, walletType: HDSegwitBech32Wallet.type },
@@ -108,18 +111,37 @@ const WalletsAdd: React.FC = () => {
   const [backdoorPressed, setBackdoorPressed] = useState(0);
   const isLoading = state.isLoading;
   const walletBaseURI = state.walletBaseURI;
-  const selectedIndex = state.selectedIndex;
   const label = state.label;
-  const selectedWalletType = state.selectedWalletType;
-  const colorScheme = useColorScheme();
   //
   const { addWallet, saveToDisk } = useStorage();
-  const { entropy: entropyHex, words } = useRoute<RouteProps>().params || {};
+  const route = useRoute<RouteProps>();
+  const {
+    entropy: entropyHex,
+    providedEntropyBytes,
+    words,
+    selectedIndex: routeSelectedIndex,
+    selectedWalletType: routeSelectedWalletType,
+  } = route.params || {};
+  const selectedIndex = typeof routeSelectedIndex === 'number' ? routeSelectedIndex : state.selectedIndex;
+  const selectedWalletType: ButtonSelected =
+    routeSelectedWalletType === Chain.OFFCHAIN
+      ? ButtonSelected.OFFCHAIN
+      : routeSelectedWalletType === Chain.ONCHAIN
+        ? ButtonSelected.ONCHAIN
+        : routeSelectedWalletType === ButtonSelected.VAULT
+          ? ButtonSelected.VAULT
+          : routeSelectedWalletType === ButtonSelected.ARK
+            ? ButtonSelected.ARK
+            : state.selectedWalletType;
   const entropy = entropyHex ? hexToUint8Array(entropyHex) : undefined;
-  const { navigate, goBack, setOptions, setParams } = useExtendedNavigation<NavigationProps>();
+  const entropyBytesProvided = providedEntropyBytes ?? 0;
+  const { navigate, goBack, setParams } = useNavigation<NavigationProps>();
   const stylesHook = {
     advancedText: {
       color: colors.feeText,
+    },
+    entropyMixedText: {
+      color: colors.alternativeTextColor,
     },
     label: {
       borderColor: colors.formBorder,
@@ -139,14 +161,19 @@ const WalletsAdd: React.FC = () => {
     },
   };
 
-  const entropyButtonText = useMemo(() => {
-    if (!entropy) {
-      return loc.wallets.add_entropy_provide;
-    }
-    return loc.formatString(loc.wallets.add_entropy_bytes, {
-      bytes: entropy?.length,
-    });
-  }, [entropy]);
+  const hasStoredLndHub = (walletBaseURI ?? '').trim().length > 0;
+
+  const setSelectedWalletType = useCallback(
+    (value: ButtonSelected) => {
+      const paramWalletType: Chain | 'VAULT' | 'ARK' =
+        value === ButtonSelected.ONCHAIN ? Chain.ONCHAIN : value === ButtonSelected.OFFCHAIN ? Chain.OFFCHAIN : value;
+      setParams({
+        selectedWalletType: paramWalletType,
+        selectedIndex,
+      });
+    },
+    [selectedIndex, setParams],
+  );
 
   const confirmResetEntropy = useCallback(
     (newWalletType: ButtonSelected) => {
@@ -163,7 +190,7 @@ const WalletsAdd: React.FC = () => {
               text: loc._.ok,
               style: 'destructive',
               onPress: () => {
-                setParams({ entropy: undefined, words: undefined });
+                setParams({ entropy: undefined, providedEntropyBytes: undefined, words: undefined });
                 setSelectedWalletType(newWalletType);
               },
             },
@@ -174,68 +201,8 @@ const WalletsAdd: React.FC = () => {
         setSelectedWalletType(newWalletType);
       }
     },
-    [entropy, setParams, words],
+    [entropy, setParams, setSelectedWalletType, words],
   );
-
-  const toolTipActions = useMemo(() => {
-    const walletSubactions: Action[] = [
-      {
-        id: index2walletType[0].walletType,
-        text: index2walletType[0].text,
-        subtitle: index2walletType[0].subtitle,
-        menuState: selectedIndex === 0 && selectedWalletType === ButtonSelected.ONCHAIN,
-      },
-      {
-        id: index2walletType[1].walletType,
-        text: index2walletType[1].text,
-        subtitle: index2walletType[1].subtitle,
-        menuState: selectedIndex === 1 && selectedWalletType === ButtonSelected.ONCHAIN,
-      },
-      {
-        id: index2walletType[2].walletType,
-        text: index2walletType[2].text,
-        subtitle: index2walletType[2].subtitle,
-        menuState: selectedIndex === 2 && selectedWalletType === ButtonSelected.ONCHAIN,
-      },
-      {
-        id: index2walletType[3].walletType,
-        text: index2walletType[3].text,
-        subtitle: index2walletType[3].subtitle,
-        menuState: selectedWalletType === ButtonSelected.OFFCHAIN,
-      },
-    ];
-
-    const walletAction: Action = {
-      id: 'wallets',
-      text: loc.multisig.wallet_type,
-      subactions: walletSubactions,
-      displayInline: true,
-    };
-
-    const entropySubActions: Action[] = [
-      {
-        id: '12_words',
-        text: loc.wallets.add_wallet_seed_length_12,
-        subtitle: loc.wallets.add_wallet_seed_length,
-        menuState: words === 12,
-      },
-      {
-        id: '24_words',
-        text: loc.wallets.add_wallet_seed_length_24,
-        subtitle: loc.wallets.add_wallet_seed_length,
-        menuState: words === 24,
-      },
-      { ...CommonToolTipActions.ResetToDefault, hidden: !entropy },
-    ];
-
-    const entropyActions: Action = {
-      ...CommonToolTipActions.Entropy,
-      text: entropyButtonText,
-      subactions: entropySubActions,
-    };
-
-    return selectedWalletType === ButtonSelected.ONCHAIN ? [walletAction, entropyActions] : [walletAction];
-  }, [selectedWalletType, selectedIndex, entropy, words, entropyButtonText]);
 
   const handleOnLightningArkButtonPressed = useCallback(() => {
     confirmResetEntropy(ButtonSelected.ARK);
@@ -244,41 +211,6 @@ const WalletsAdd: React.FC = () => {
   const handleOnLightningButtonPressed = useCallback(() => {
     confirmResetEntropy(ButtonSelected.OFFCHAIN);
   }, [confirmResetEntropy]);
-
-  const HeaderRight = useMemo(
-    () => (
-      <HeaderMenuButton
-        onPressMenuItem={(id: string) => {
-          if (id === LightningCustodianWallet.type) {
-            handleOnLightningButtonPressed();
-          } else if (id === '12_words') {
-            navigate('ProvideEntropy', { words: 12, entropy: entropy ? uint8ArrayToHex(entropy) : undefined });
-          } else if (id === '24_words') {
-            navigate('ProvideEntropy', { words: 24, entropy: entropy ? uint8ArrayToHex(entropy) : undefined });
-          } else if (id === CommonToolTipActions.ResetToDefault.id) {
-            confirmResetEntropy(ButtonSelected.ONCHAIN);
-          } else {
-            for (let c = 0; c < Object.values(index2walletType).length; c++) {
-              if (index2walletType[c].walletType === id) {
-                // found our item that was pressed
-                setSelectedIndex(c);
-                break;
-              }
-            }
-          }
-        }}
-        actions={toolTipActions}
-      />
-    ),
-    [handleOnLightningButtonPressed, toolTipActions, entropy, confirmResetEntropy, navigate],
-  );
-
-  useEffect(() => {
-    setOptions({
-      headerRight: () => HeaderRight,
-      statusBarStyle: Platform.select({ ios: 'light', default: colorScheme === 'dark' ? 'light' : 'dark' }),
-    });
-  }, [HeaderRight, colorScheme, colors.foregroundColor, setOptions, toolTipActions]);
 
   useEffect(() => {
     // resetting format of last camera qr scan, in case user will use camera to
@@ -299,16 +231,8 @@ const WalletsAdd: React.FC = () => {
     dispatch({ type: 'SET_WALLET_BASE_URI', payload: value });
   };
 
-  const setSelectedIndex = (value: number) => {
-    dispatch({ type: 'SET_SELECTED_INDEX', payload: value });
-  };
-
   const setLabel = (value: string) => {
     dispatch({ type: 'SET_LABEL', payload: value });
-  };
-
-  const setSelectedWalletType = (value: ButtonSelected) => {
-    dispatch({ type: 'SET_SELECTED_WALLET_TYPE', payload: value });
   };
 
   const createWallet = async () => {
@@ -346,9 +270,9 @@ const WalletsAdd: React.FC = () => {
         if (entropy) {
           try {
             await w.generateFromEntropy(entropy);
-          } catch (e: any) {
-            console.log(e.toString());
-            presentAlert({ message: e.toString() });
+          } catch (e) {
+            console.log(String(e));
+            presentAlert({ message: String(e) });
             return;
           }
         } else {
@@ -389,11 +313,11 @@ const WalletsAdd: React.FC = () => {
       }
       await wallet.createAccount();
       await wallet.authorize();
-    } catch (Err: any) {
+    } catch (Err) {
       setIsLoading(false);
       console.warn('lnd create failure', Err);
-      if (Err.message) {
-        return presentAlert({ message: Err.message });
+      if (errorMessage(Err)) {
+        return presentAlert({ message: errorMessage(Err) });
       } else {
         return presentAlert({ message: loc.wallets.add_lndhub_error });
       }
@@ -415,10 +339,10 @@ const WalletsAdd: React.FC = () => {
     wallet.setLabel(label || loc.wallets.details_title);
     try {
       await wallet.generate();
-    } catch (Err: any) {
+    } catch (Err) {
       setIsLoading(false);
       console.warn('lightning ark create failure', Err);
-      return presentAlert({ message: Err.message ?? '' });
+      return presentAlert({ message: errorMessage(Err) });
     }
 
     addWallet(wallet);
@@ -511,8 +435,16 @@ const WalletsAdd: React.FC = () => {
               size={styles.button}
             />
           ) : null}
-          {selectedWalletType === ButtonSelected.OFFCHAIN && LightningButtonMemo}
+          {(selectedWalletType === ButtonSelected.OFFCHAIN || hasStoredLndHub) && LightningButtonMemo}
         </View>
+        {entropy && entropyBytesProvided > 0 && selectedWalletType === ButtonSelected.ONCHAIN ? (
+          <View style={styles.entropyMixed} testID="EntropyMixedIndicator">
+            <Icon name="dice" type="font-awesome-6" size={16} color={colors.alternativeTextColor} />
+            <BlueText style={[styles.entropyMixedText, stylesHook.entropyMixedText]}>
+              {loc.formatString(loc.wallets.add_entropy_mixed, { bytes: entropyBytesProvided })}
+            </BlueText>
+          </View>
+        ) : null}
         <View style={styles.advanced}>
           {selectedWalletType === ButtonSelected.OFFCHAIN && (
             <>
@@ -587,6 +519,8 @@ const styles = StyleSheet.create({
     flex: 1,
     marginHorizontal: 8,
     color: '#81868e',
+    fontSize: 15,
+    lineHeight: 19,
   },
   buttons: {
     flexDirection: 'column',
@@ -601,6 +535,17 @@ const styles = StyleSheet.create({
   },
   advanced: {
     marginHorizontal: 20,
+  },
+  entropyMixed: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginHorizontal: 20,
+    marginTop: 12,
+    gap: 8,
+  },
+  entropyMixedText: {
+    flexShrink: 1,
+    fontSize: 14,
   },
   lndUri: {
     flexDirection: 'row',

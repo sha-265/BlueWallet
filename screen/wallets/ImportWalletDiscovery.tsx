@@ -1,9 +1,12 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { RouteProp, useRoute } from '@react-navigation/native';
-import { ActivityIndicator, FlatList, LayoutAnimation, Platform, StyleSheet, UIManager, View } from 'react-native';
+import { useNavigation, RouteProp, useRoute } from '@react-navigation/native';
+import { ActivityIndicator, FlatList, Platform, StyleSheet, View } from 'react-native';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
-import { BlueButtonLink, BlueFormLabel, BlueText } from '../../BlueComponents';
-import { HDSegwitBech32Wallet, WatchOnlyWallet } from '../../class';
+import BlueButtonLink from '../../components/BlueButtonLink';
+import BlueFormLabel from '../../components/BlueFormLabel';
+import BlueText from '../../components/BlueText';
+import { HDSegwitBech32Wallet } from '../../class/wallets/hd-segwit-bech32-wallet';
+import { WatchOnlyWallet } from '../../class/wallets/watch-only-wallet';
 import startImport, { TImport } from '../../class/wallet-import';
 import presentAlert from '../../components/Alert';
 import Button from '../../components/Button';
@@ -17,9 +20,9 @@ import { AddWalletStackParamList } from '../../navigation/AddWalletStack';
 import { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import { THDWalletForWatchOnly, TWallet } from '../../class/wallets/types';
 import { useSettings } from '../../hooks/context/useSettings';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import { useScreenProtect } from '../../hooks/useScreenProtect';
 import { BlueSpacing10, BlueSpacing20, BlueSpacing40 } from '../../components/BlueSpacing';
+import { errorMessage } from '../../helpers/errorMessage';
 
 type RouteProps = RouteProp<AddWalletStackParamList, 'ImportWalletDiscovery'>;
 type NavigationProp = NativeStackNavigationProp<AddWalletStackParamList, 'ImportWalletDiscovery'>;
@@ -30,12 +33,8 @@ type WalletEntry = {
   id: string;
 };
 
-if (Platform.OS === 'android' && UIManager.setLayoutAnimationEnabledExperimental) {
-  UIManager.setLayoutAnimationEnabledExperimental(true);
-}
-
 const ImportWalletDiscovery: React.FC = () => {
-  const navigation = useExtendedNavigation<NavigationProp>();
+  const navigation = useNavigation<NavigationProp>();
   const { colors } = useTheme();
   const route = useRoute<RouteProps>();
   const { importText, askPassphrase, searchAccounts } = route.params;
@@ -53,6 +52,16 @@ const ImportWalletDiscovery: React.FC = () => {
     const hd = new HDSegwitBech32Wallet();
     hd.setSecret(importText);
     return hd.validateMnemonic();
+  }, [importText]);
+
+  const isWatchOnlyHd = useMemo(() => {
+    try {
+      const wallet = new WatchOnlyWallet();
+      wallet.setSecret(importText);
+      return wallet.valid() && wallet.isHd();
+    } catch {
+      return false;
+    }
   }, [importText]);
 
   const stylesHook = StyleSheet.create({
@@ -83,7 +92,6 @@ const ImportWalletDiscovery: React.FC = () => {
     const onProgress = (data: string) => setProgress(data);
 
     const onWallet = (wallet: TWallet | THDWalletForWatchOnly) => {
-      LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
       const id = wallet.getID();
       let subtitle: string | undefined;
 
@@ -111,8 +119,8 @@ const ImportWalletDiscovery: React.FC = () => {
         const pass = await prompt(title, subtitle);
         setPassword(pass);
         return pass;
-      } catch (e: any) {
-        if (e.message === 'Cancel Pressed') {
+      } catch (e) {
+        if (errorMessage(e) === 'Cancel Pressed') {
           navigation.goBack();
         }
         throw e;
@@ -135,7 +143,6 @@ const ImportWalletDiscovery: React.FC = () => {
         presentAlert({ title: 'Import error', message: e.message });
       })
       .finally(() => {
-        LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
         setLoading(false);
       });
 
@@ -244,7 +251,7 @@ const ImportWalletDiscovery: React.FC = () => {
         removeClippedSubviews={false}
       />
       <View style={[styles.center, stylesHook.center]}>
-        {bip39 && (
+        {(bip39 || isWatchOnlyHd) && (
           <BlueButtonLink
             title={loc.wallets.import_discovery_derivation}
             testID="CustomDerivationPathButton"

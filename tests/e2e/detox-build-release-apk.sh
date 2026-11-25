@@ -21,7 +21,7 @@ keytool -genkeypair -v -keystore detox.keystore -alias detox -keyalg RSA -keysiz
 
 if [[ "$USE_FASTLANE" == "1" ]]; then
 	# Build signed release APK via Fastlane; assume env provides keystore inputs when needed
-	bundle exec fastlane android build_release_apk
+	BUILD_NUMBER=${BUILD_NUMBER:-1} bundle exec fastlane android build_release_apk
 	# Build androidTest APK for Detox
 	(cd android && ./gradlew assembleAndroidTest -DtestBuildType=release)
 	# Pick the newest release APK produced by Fastlane
@@ -35,6 +35,8 @@ else
 	GRADLE_ARCH_ARGS+=("-PreactNativeArchitectures=${ARCHITECTURES}")
 	(cd android && ./gradlew assembleRelease assembleReleaseAndroidTest -DtestBuildType=release "${GRADLE_ARCH_ARGS[@]}")
 	RELEASE_APK=./android/app/build/outputs/apk/release/app-release.apk
+	UNSIGNED_RELEASE_APK=./android/app/build/outputs/apk/release/app-release-unsigned.apk
+	mv "$UNSIGNED_RELEASE_APK" "$RELEASE_APK"
 	TEST_APK=./android/app/build/outputs/apk/androidTest/release/app-release-androidTest.apk
 fi
 

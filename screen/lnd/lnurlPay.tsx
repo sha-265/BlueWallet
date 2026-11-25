@@ -1,12 +1,14 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { RouteProp, useLocale, useRoute } from '@react-navigation/native';
+import { useNavigation, RouteProp, useLocale, useRoute } from '@react-navigation/native';
 import React, { useEffect, useState } from 'react';
 import { Image, ScrollView, StyleSheet, Text, TouchableOpacity, View } from 'react-native';
 import Icon from '../../components/Icon';
 import { btcToSatoshi, fiatToBTC, satoshiToBTC, satoshiToLocalCurrency } from '../../blue_modules/currency';
 import triggerHapticFeedback, { HapticFeedbackTypes } from '../../blue_modules/hapticFeedback';
-import { BlueCard, BlueText } from '../../BlueComponents';
+import BlueCard from '../../components/BlueCard';
+import BlueText from '../../components/BlueText';
 import Lnurl from '../../class/lnurl';
+import type { LnurlPayServicePayload } from '../../class/lnurl';
 import presentAlert from '../../components/Alert';
 import * as AmountInput from '../../components/AmountInput';
 import Button from '../../components/Button';
@@ -17,33 +19,28 @@ import { unlockWithBiometrics, useBiometrics } from '../../hooks/useBiometrics';
 import loc, { formatBalance, formatBalanceWithoutSuffix } from '../../loc';
 import { BitcoinUnit, Chain } from '../../models/bitcoinUnits';
 import { useStorage } from '../../hooks/context/useStorage';
-import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 import { DismissKeyboardInputAccessory, DismissKeyboardInputAccessoryViewID } from '../../components/DismissKeyboardInputAccessory';
 import { LightningCustodianWallet } from '../../class/wallets/lightning-custodian-wallet';
 import { TWallet } from '../../class/wallets/types';
 import { pop } from '../../NavigationService';
 import { BlueSpacing20 } from '../../components/BlueSpacing';
 import { BlueLoading } from '../../components/BlueLoading';
-
-type RouteParams = {
-  walletID: string;
-  lnurl: string;
-};
+import { DetailViewStackParamList } from '../../navigation/DetailViewStackParamList';
 
 const _cacheFiatToSat: Record<string, string> = {};
 
 const LnurlPay: React.FC = () => {
   const { wallets } = useStorage();
   const { isBiometricUseCapableAndEnabled } = useBiometrics();
-  const route = useRoute<RouteProp<Record<string, RouteParams>, string>>();
+  const route = useRoute<RouteProp<DetailViewStackParamList, 'LnurlPay'>>();
   const { walletID, lnurl } = route.params;
   const wallet = wallets.find(w => w.getID() === walletID) as LightningCustodianWallet;
   const [unit, setUnit] = useState<BitcoinUnit>(wallet?.getPreferredBalanceUnit() ?? BitcoinUnit.BTC);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [_LN, setLN] = useState<Lnurl | undefined>();
   const [payButtonDisabled, setPayButtonDisabled] = useState<boolean>(true);
-  const [payload, setPayload] = useState<any>();
-  const { setParams, navigate } = useExtendedNavigation();
+  const [payload, setPayload] = useState<LnurlPayServicePayload | undefined>();
+  const { setParams, navigate } = useNavigation();
   const [amount, setAmount] = useState<string | undefined>();
   const { colors } = useTheme();
   const { direction } = useLocale();
@@ -139,7 +136,7 @@ const LnurlPay: React.FC = () => {
     try {
       let comment: string | undefined;
       if (_LN.getCommentAllowed()) {
-        comment = await prompt('Comment', '', false, 'plain-text');
+        comment = await prompt('Comment', '', { cancelable: false, type: 'plain-text' });
       }
 
       const bolt11payload = await _LN.requestBolt11FromLnurlPayService(amountSats, comment);
@@ -178,7 +175,7 @@ const LnurlPay: React.FC = () => {
           style={styles.walletSelectTouch}
           onPress={() => navigate('SelectWallet', { onWalletSelect, chainType: Chain.OFFCHAIN })}
         >
-          <Text style={styles.walletSelectText}>{loc.wallets.select_wallet.toLowerCase()}</Text>
+          <Text style={styles.walletSelectText}>{loc.wallets.select_wallet}</Text>
           <Icon name={direction === 'rtl' ? 'angle-left' : 'angle-right'} size={18} type="font-awesome" color="#9aa0aa" />
         </TouchableOpacity>
       )}
@@ -215,8 +212,8 @@ const LnurlPay: React.FC = () => {
             <DismissKeyboardInputAccessory />
             <BlueText style={styles.alignSelfCenter}>
               {loc.formatString(loc.lndViewInvoice.please_pay_between_and, {
-                min: formatBalance(payload?.min, unit),
-                max: formatBalance(payload?.max, unit),
+                min: formatBalance(payload?.min ?? 0, unit),
+                max: formatBalance(payload?.max ?? 0, unit),
               })}
             </BlueText>
             <BlueSpacing20 />
