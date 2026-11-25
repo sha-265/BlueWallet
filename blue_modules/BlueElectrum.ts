@@ -18,10 +18,12 @@ import { triggerWarningHapticFeedback } from './hapticFeedback';
 import { AlertButton } from 'react-native';
 import { uint8ArrayToHex, stringToUint8Array, hexToUint8Array } from './uint8array-extras/index';
 import { errorMessage } from '../helpers/errorMessage';
+import { useExtendedNavigation } from '../../hooks/useExtendedNavigation';
 
 const ElectrumClient = require('electrum-client');
 const net = require('net');
 const tls = require('tls');
+const navigation = useExtendedNavigation();
 
 export type ElectrumTransaction = {
   txid: string;
@@ -659,15 +661,9 @@ async function presentNetworkErrorAlert(usingPeer?: Peer, allowRepeat = false) {
         style: 'default',
       },
       {
-        text: loc.settings.electrum_reset,
-        onPress: async () => {
-          const result = await presentResetToDefaultsAlert();
-          if (result) {
-            forceDisconnect();
-            setTimeout(() => {
-              ensureConnected({ showAlertOnFailure: true }).catch(() => {});
-            }, 500);
-          }
+        text: loc.send.open_settings,
+        onPress: () => {
+          navigation.navigate('ElectrumSettings');
         },
         style: 'destructive',
       },
